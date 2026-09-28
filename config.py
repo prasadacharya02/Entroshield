@@ -171,6 +171,66 @@ WHITELISTED_PROCESSES = [
     "code.exe", "explorer.exe",
 ]
 
+# ── Never-kill list: ordinary user & OS software ─────────────
+# These processes routinely hold *legitimate* handles on files in a
+# user folder — the Windows Search indexer (SearchFilterHost /
+# SearchProtocolHost / SearchIndexer), the COM surrogate (dllhost),
+# browsers that just downloaded a file, OneDrive/Dropbox sync, Office,
+# the AV engine. Open-handle attribution alone therefore CANNOT prove
+# they are the writer.
+#
+# Killing any of them is a worse outcome than a late kill: it destroys
+# the operator's session and has nothing to do with the ransomware.
+# They are refused at attribution time (never offered as a candidate),
+# inside the campaign kill memory, and again at the termination gate —
+# three independent layers, so a single bad attribution cannot reach
+# os.kill().
+DENY_KILL_PROCESSES = [
+    # Windows shell / search / COM infrastructure
+    "dllhost.exe", "searchfilterhost.exe", "searchprotocolhost.exe",
+    "searchindexer.exe", "sihost.exe", "runtimebroker.exe", "wmiprvse.exe",
+    "taskhostw.exe", "ctfmon.exe", "textinputhost.exe", "dwm.exe",
+    "fontdrvhost.exe", "audiodg.exe", "spoolsv.exe", "winlogon.exe",
+    "securityhealthservice.exe", "securityhealthsystray.exe",
+    "smartscreen.exe", "backgroundtaskhost.exe", "conhost.exe",
+    # Browsers
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+    "vivaldi.exe", "iexplore.exe", "msedgewebview2.exe",
+    # Cloud sync / collaboration
+    "onedrive.exe", "dropbox.exe", "googledrivesync.exe", "teams.exe",
+    "ms-teams.exe", "zoom.exe", "slack.exe", "discord.exe",
+    # Office / PDF readers
+    "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe",
+    "acrord32.exe", "acrobat.exe", "notepad.exe", "notepad++.exe",
+    # Endpoint protection
+    "msmpeng.exe", "nissrv.exe", "mpcmdrun.exe", "avp.exe", "avastui.exe",
+    # macOS / Linux desktop equivalents
+    "finder", "google chrome", "safari", "firefox", "chromium",
+    "chromium-browser", "google-chrome", "gnome-shell", "nautilus",
+    "tracker-miner-fs", "gvfsd", "baloo_file",
+]
+
+_DENY_KILL_SET = {name.lower() for name in DENY_KILL_PROCESSES}
+
+
+def is_denied_process(process_name: str | None) -> bool:
+    """True when this process must never be auto-terminated.
+
+    Matches the full name and the basename, so both ``dllhost.exe`` and
+    ``C:\\Windows\\System32\\dllhost.exe`` are refused.
+    """
+    if not process_name:
+        return False
+    name = str(process_name).strip().lower()
+    if name in _DENY_KILL_SET:
+        return True
+    basename = os.path.basename(name.replace("\\", "/"))
+    if basename in _DENY_KILL_SET:
+        return True
+    # Windows search infrastructure can appear with suffixes
+    # (e.g. "SearchFilterHost.exe", "SearchProtocolHost.exe").
+    return basename.startswith("search") and basename.endswith("host.exe")
+
 # ── Self-kill safety gate ────────────────────────────────────
 # Command-line fragments that identify THIS software (defender
 # pipeline, dashboards, lab services). The response layer refuses to

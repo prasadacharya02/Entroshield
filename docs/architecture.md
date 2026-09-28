@@ -30,6 +30,8 @@ monitoring.event_pipeline.EventPipeline (queue 10000, batch 50)
       - DQN (opt-in, torch fallback)
     → response.response_module (terminate + quarantine)
       - ProcessTerminator: verified PID only, zombie-aware, self-kill whitelist
+      - Never-kill gate (config.DENY_KILL_PROCESSES): user/OS software refused
+        at attribution, in campaign kill memory and at the termination gate
       - FileQuarantine: install-time folder, SHA3-256 + SHA-256 dual hash, meta.json
     → Campaign sweep (quarantine+restore all campaign files)
     → Post-kill verification (walk estate, hash vs last clean, repair mid-write)
@@ -95,6 +97,13 @@ SOC dashboard stays at 0 events. The supervisor removes that failure mode:
 
 - Attacker confined to victim_server/user_files via safe_path() check
 - Defender never kills whitelisted or own tooling (DEFENDER_TOOLING_MARKERS)
+- Never-kill list (DENY_KILL_PROCESSES): browsers, Windows search/COM
+  surrogates, sync clients, Office and the EDR itself are never terminated,
+  whatever the attribution layer reports
+- Unverifiable attribution is never published as a named process: such events
+  record `unattributed` with no PID
+- SOC counters/monitor/decision panel report executed outcomes only (a refused
+  kill is `terminate_refused` + status `TERMINATE_REFUSED+QUARANTINED`)
 - Vault PIN compare_digest, session 8h, scope quarantine_only
 - Quarantine files cannot be decrypted (os.urandom, no key) - honest
 
@@ -107,4 +116,4 @@ These emit DeprecationWarning and delegate to canonical implementations.
 
 ### For 200 Marks
 
-This architecture is not PowerPoint - it's running code with 126 tests, deterministic benchmark, live demo verified, honest limitations published.
+This architecture is not PowerPoint - it's running code with 218 tests, deterministic benchmark, live demo verified, honest limitations published.

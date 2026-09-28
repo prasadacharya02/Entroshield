@@ -107,6 +107,21 @@ def init_db():
 from blockchain.fingerprint_exchange import get_exchange  # noqa: F401
 
 
+def _table_columns(conn, table: str) -> set:
+    """Names of the columns that actually exist in *table*."""
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    except Exception:
+        return set()
+    names = set()
+    for row in rows:
+        try:
+            names.add(row["name"])
+        except (TypeError, IndexError):
+            names.add(row[1])
+    return names
+
+
 def save_to_db(conn, event, action, status, outcome=None, decision=None,
                restore_result=None):
     """Save a processed event to the SQLite database."""
@@ -114,35 +129,48 @@ def save_to_db(conn, event, action, status, outcome=None, decision=None,
         proc     = event.get("process") or {}
         pid      = proc.get("pid")      if isinstance(proc, dict) else None
         procname = proc.get("name", "unknown") if isinstance(proc, dict) else "unknown"
+        # A best-effort guess must never name an innocent process in the
+        # SOC: only a real attribution (open handle / verified identity)
+        # is published under a name and a PID.
+        if isinstance(proc, dict) and proc.get("attribution_source") in (
+                "recent_process_guess", "none"):
+            procname = "unattributed"
+            pid = None
         outcome = outcome or status
         decision = decision or {}
         q_values = decision.get("q_values")
-        conn.execute("""
-            INSERT INTO events
-            (timestamp, file_path, event_type, entropy,
-             entropy_delta, pid, process_name, action, status,
-             requested_action, outcome, restore_result, dry_run,
-             engine, confidence, explanation, q_values)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            event.get("timestamp", datetime.now().isoformat()),
-            event.get("file_path", ""),
-            event.get("event_type", ""),
-            event.get("entropy_overall") or 0.0,
-            event.get("entropy_delta")   or 0.0,
-            pid,
-            procname,
-            action,
-            status,
-            action,
-            outcome,
-            restore_result,
-            1 if config.DRY_RUN else 0,
-            decision.get("engine") or "rules",
-            float(decision.get("confidence") or 0.0),
-            decision.get("explanation") or "",
-            json.dumps(q_values) if q_values is not None else None,
-        ))
+        columns = {
+            "timestamp": event.get("timestamp", datetime.now().isoformat()),
+            "file_path": event.get("file_path", ""),
+            "event_type": event.get("event_type", ""),
+            "entropy": event.get("entropy_overall") or 0.0,
+            "entropy_delta": event.get("entropy_delta") or 0.0,
+            "pid": pid,
+            "process_name": procname,
+            "action": action,
+            "status": status,
+            "requested_action": action,
+            "outcome": outcome,
+            "restore_result": restore_result,
+            "dry_run": 1 if config.DRY_RUN else 0,
+            "engine": decision.get("engine") or "rules",
+            "confidence": float(decision.get("confidence") or 0.0),
+            "explanation": decision.get("explanation") or "",
+            "q_values": json.dumps(q_values) if q_values is not None else None,
+            "threat_score": float(event.get("threat_score") or 0.0),
+        }
+        # Third-party callers (benchmarks, drills) may hold an older
+        # events schema. Insert only the columns that exist so a
+        # missing threat_score column cannot silently drop a record.
+        present = _table_columns(conn, "events")
+        if present:
+            columns = {k: v for k, v in columns.items() if k in present}
+        names = ", ".join(columns)
+        marks = ",".join("?" for _ in columns)
+        conn.execute(
+            f"INSERT INTO events ({names}) VALUES ({marks})",
+            tuple(columns.values()),
+        )
         conn.commit()
     except Exception as e:
         log.error(f"[DB] Save failed: {e}")
@@ -287,6 +315,18 @@ def make_decision(event: dict) -> int:
 # RESPONSE EXECUTOR
 # ============================================================
 
+# ── What the last execute_response() call really achieved ─────
+# The SOC counters and the process monitor must never claim a kill or
+# a containment that the safety gates refused, so the outcome of every
+# response is published here for the caller to read back.
+_LAST_RESPONSE: dict = {}
+
+
+def response_summary() -> dict:
+    """Copy of the last :func:`execute_response` result summary."""
+    return dict(_LAST_RESPONSE)
+
+
 def execute_response(action: int,
                      event: dict,
                      bc: BlockchainConnector,
@@ -325,7 +365,7 @@ def execute_response(action: int,
     if action == config.ACTION_IGNORE:
         log.info(f"  [OK]     {fname} | H={entropy:.2f}")
         save_to_db(db_conn, event, action, status, outcome, decision)
-        return status
+        return _publish_response(action, status, outcome, None, None, None)
 
     # ── ALERT ─────────────────────────────────────
     if action == config.ACTION_ALERT:
@@ -425,6 +465,19 @@ def execute_response(action: int,
         if restore_result:
             outcome = f"{outcome}+{restore_result}"
 
+    # ── Honest action label ───────────────────────
+    # The stored status must describe what the response layer actually
+    # achieved: a kill the safety gates refused is not a kill, and the
+    # SOC process monitor / event table render this column verbatim.
+    if terminate_result is not None:
+        contained = quarantine_result in (
+            "QUARANTINED", "DRY_RUN_QUARANTINE", "FILE_ALREADY_MOVED")
+        if terminate_result == "TERMINATED":
+            status = "TERMINATED+QUARANTINED" if contained else "TERMINATED"
+        else:
+            status = ("TERMINATE_REFUSED+QUARANTINED" if contained
+                      else "TERMINATE_REFUSED")
+
     # ── FORENSIC REPORT for every incident ────────
     if action >= config.ACTION_ALERT:
         try:
@@ -503,10 +556,28 @@ def execute_response(action: int,
 
     # Return the detailed outcome (e.g. "DRY_RUN_QUARANTINE+DRY_RUN_RESTORE"),
     # not just the action label — callers and the dashboard rely on it.
-    return outcome
+    return _publish_response(action, status, outcome, terminate_result,
+                             quarantine_result, restore_result)
 
 
 _LAST_KILL: dict = {}
+
+
+def _publish_response(action, status, outcome, terminate_result,
+                      quarantine_result, restore_result):
+    """Record what this response achieved and return the outcome string."""
+    _LAST_RESPONSE.clear()
+    _LAST_RESPONSE.update({
+        "action": action,
+        "status": status,
+        "outcome": outcome,
+        "terminated": terminate_result == "TERMINATED",
+        "kill_refused": terminate_result == "TERMINATE_REFUSED",
+        "quarantined": quarantine_result in (
+            "QUARANTINED", "DRY_RUN_QUARANTINE", "FILE_ALREADY_MOVED"),
+        "restored": restore_result in ("RESTORED", "DRY_RUN_RESTORE"),
+    })
+    return outcome
 
 
 def _kill_record(killed: bool, pid, procname: str,
@@ -561,6 +632,14 @@ def _terminate_process(pid, procname: str, process_info: dict | None = None):
         log.warning(
             "  [SAFE] Process attribution is best-effort; "
             "automatic termination refused"
+        )
+        return False
+    # Final gate: ordinary user/OS software is never terminated
+    # automatically, whatever the attribution layer reported.
+    if config.is_denied_process(expected_name):
+        log.warning(
+            "  [SAFE] %s is on the never-kill list (user/OS software); "
+            "termination refused", expected_name,
         )
         return False
     if expected_pid != pid or not expected_name or expected_name != procname:
@@ -705,6 +784,11 @@ class CampaignTracker:
         if not isinstance(proc, dict):
             return None
         if not (proc.get("identity_verified") and proc.get("pid")):
+            return None
+        # Ordinary user/OS software (browser, search indexer, COM
+        # surrogate, sync client, …) is never a kill target — not even
+        # if a handle scan attributed the file to it.
+        if config.is_denied_process(proc.get("name")):
             return None
         # Never let the defender's own software be a kill target.
         cmdline = str(proc.get("cmdline") or "").lower()
@@ -1246,7 +1330,8 @@ class PipelineRunner:
                     config.ACTION_TERMINATE_QUARANTINE, se,
                     self.bc, self.db, se_decision, backup=self.backup
                 )
-                self.stats["quarantined"] += 1
+                if response_summary().get("quarantined"):
+                    self.stats["quarantined"] += 1
                 log.warning(
                     f"  [SWEEP] {os.path.basename(se.get('file_path',''))} "
                     f"→ {sweep_status}")
@@ -1286,15 +1371,25 @@ class PipelineRunner:
                 pass
 
         # ── Update stats ───────────────────────────
+        # Count what actually happened: a kill or a containment the
+        # safety layer refused must never be reported as a success.
+        summary = response_summary()
         if action == config.ACTION_IGNORE:
             self.stats["ignored"] += 1
         elif action == config.ACTION_ALERT:
             self.stats["alerted"] += 1
-        elif action == config.ACTION_TERMINATE:
-            self.stats["terminated"] += 1
-        elif action == config.ACTION_TERMINATE_QUARANTINE:
-            self.stats["terminated"]  += 1
-            self.stats["quarantined"] += 1
+        else:
+            # "terminated" counts real kills only; refusals are visible
+            # in the event status column instead.
+            if summary.get("terminated"):
+                self.stats["terminated"] += 1
+            elif action >= config.ACTION_TERMINATE and config.DRY_RUN:
+                # Dry-run simulates the kill; keep the demo counter live.
+                self.stats["terminated"] += 1
+            if summary.get("quarantined"):
+                self.stats["quarantined"] += 1
+            elif action == config.ACTION_TERMINATE_QUARANTINE and config.DRY_RUN:
+                self.stats["quarantined"] += 1
 
     @staticmethod
     def _defender_echo(event: dict) -> str | None:
@@ -1417,7 +1512,8 @@ class PipelineRunner:
                                     strict=True)
                             except Exception:
                                 pass
-                        self.stats["quarantined"] += 1
+                        if response_summary().get("quarantined"):
+                            self.stats["quarantined"] += 1
                         log.warning(f"  [SWEEP] {name} → {sweep_status}")
                     except Exception as e:
                         log.error(f"  [SWEEP] Failed for {path}: {e}")

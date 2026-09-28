@@ -197,17 +197,27 @@ def health():
 def stats():
     try:
         db  = get_db()
+        # Every counter describes what actually happened: a kill the
+        # safety gates refused is recorded as a refusal, never as a
+        # kill, and a failed restore is not a recovery.
         row = db.execute("""
             SELECT
                 COUNT(*)                    AS total,
                 SUM(CASE WHEN action >= 1
                     THEN 1 ELSE 0 END)      AS threats,
-                SUM(CASE WHEN action >= 2
+                SUM(CASE WHEN status LIKE 'TERMINATED%'
                     THEN 1 ELSE 0 END)      AS terminated,
-                SUM(CASE WHEN action = 3
+                SUM(CASE WHEN status LIKE 'TERMINATE_REFUSED%'
+                    THEN 1 ELSE 0 END)      AS terminate_refused,
+                SUM(CASE WHEN outcome LIKE '%QUARANTIN%'
+                    AND outcome NOT LIKE '%FAILED%'
+                    AND outcome NOT LIKE '%PARTIAL%'
                     THEN 1 ELSE 0 END)      AS quarantined,
-                SUM(CASE WHEN restore_result IS NOT NULL
+                SUM(CASE WHEN restore_result IN
+                    ('RESTORED', 'DRY_RUN_RESTORE')
                     THEN 1 ELSE 0 END)      AS recovery,
+                SUM(CASE WHEN process_name = 'unattributed'
+                    THEN 1 ELSE 0 END)      AS unattributed,
                 ROUND(AVG(entropy), 2)      AS avg_entropy,
                 ROUND(MAX(entropy), 2)      AS max_entropy
             FROM events
@@ -217,14 +227,16 @@ def stats():
         bc_count = bc.get_event_count()
 
         return jsonify({
-            "total"        : row["total"]       or 0,
-            "threats"      : row["threats"]     or 0,
-            "terminated"   : row["terminated"]  or 0,
-            "quarantined"  : row["quarantined"] or 0,
-            "recovery"     : row["recovery"]    or 0,
-            "avg_entropy"  : row["avg_entropy"] or 0,
-            "max_entropy"  : row["max_entropy"] or 0,
-            "blockchain_tx": bc_count
+            "total"            : row["total"]             or 0,
+            "threats"          : row["threats"]           or 0,
+            "terminated"       : row["terminated"]        or 0,
+            "terminate_refused": row["terminate_refused"] or 0,
+            "quarantined"      : row["quarantined"]       or 0,
+            "recovery"         : row["recovery"]          or 0,
+            "unattributed"     : row["unattributed"]      or 0,
+            "avg_entropy"      : row["avg_entropy"]       or 0,
+            "max_entropy"      : row["max_entropy"]       or 0,
+            "blockchain_tx"    : bc_count
         })
     except Exception:
         log.exception("Stats API failed")
@@ -249,11 +261,21 @@ def events():
 
 @app.route("/api/entropy")
 def entropy_data():
+    """Entropy time series for the SOC graph.
+
+    Rows the analyzer could not read (a DELETED/RENAMED event, a file
+    locked mid-write) carry entropy 0. Plotting those produced a
+    meaningless 0 ↔ 8 sawtooth that hid the real spikes. They are
+    excluded unless ``?include_unread=1`` is passed explicitly.
+    """
     try:
+        include_unread = request.args.get("include_unread") in {"1", "true", "yes"}
+        where = "" if include_unread else "WHERE entropy IS NOT NULL AND entropy > 0"
         db   = get_db()
-        rows = db.execute("""
+        rows = db.execute(f"""
             SELECT timestamp, entropy, entropy_delta, file_path
             FROM events
+            {where}
             ORDER BY id DESC
             LIMIT 100
         """).fetchall()
@@ -668,6 +690,11 @@ def dqn_last_decision():
         confidence = row["confidence"] if "confidence" in keys and row["confidence"] is not None else 0
         if isinstance(confidence, float) and confidence <= 1:
             confidence = round(confidence * 100, 1)
+        threat_score = (
+            float(row["threat_score"])
+            if "threat_score" in keys and row["threat_score"] is not None
+            else None
+        )
 
         decisions = {
             0: "IGNORE",
@@ -677,21 +704,72 @@ def dqn_last_decision():
         }
         outcome = row["outcome"] if "outcome" in keys and row["outcome"] else row["status"]
 
+        # ── Was this the engine's own verdict, or an escalation? ──
+        # Everything above the engine (campaign confirmation, ransom
+        # note, defense tamper, exchange confirmation, post-kill
+        # verification, campaign sweep) can raise the action beyond the
+        # per-file score. The panel must say which one it was — showing
+        # "TERMINATE + QUARANTINE" next to an engine line that reads
+        # "Decision: ALERT | Threat score: 0/100" is exactly the
+        # confusion this avoids.
+        escalated, escalation = False, ""
+        text = str(explanation or "")
+        for marker, label in (
+            ("CAMPAIGN CONFIRMED", "Campaign confirmed (multiple files)"),
+            ("Campaign sweep", "Campaign sweep (containment of touched files)"),
+            ("Post-kill verification", "Post-kill verification (repair pass)"),
+            ("Hard-confirmation signal", "Hard confirmation signal"),
+            ("DEFENSE TAMPER", "Defence tamper (recovery destroyed)"),
+            ("RANSOM NOTE", "Ransom note dropped"),
+            ("CONFIRMED BY EXCHANGE", "Confirmed by the federated exchange"),
+            ("Ciphertext fingerprint", "Ciphertext fingerprint (chi² uniformity)"),
+            ("Magic-byte mismatch", "Magic-byte mismatch (header destroyed)"),
+        ):
+            if marker in text:
+                escalated, escalation = True, label
+                break
+        if not escalated and action >= 2 and threat_score is not None \
+                and threat_score < 70:
+            escalated, escalation = True, "Safety-layer escalation"
+
+        # Reasons = the engine's own trailing summary, if it has one.
+        engine_opinion = text.rsplit("|", 1)[-1].strip() if "|" in text else text
+        reasons = ""
+        if "Reasons:" in text:
+            reasons = text.split("Reasons:", 1)[1].strip()
+        elif engine_opinion and not engine_opinion.startswith("Campaign"):
+            reasons = engine_opinion
+
         factors = [
-            {"name": "Engine", "value": engine, "pass": engine == "dqn"},
-            {"name": "Requested action", "value": decisions.get(action, "UNKNOWN"), "pass": action >= 1},
+            {"name": "Engine", "value": engine, "pass": engine in ("rules", "rf", "dqn")},
+            {"name": "Action taken", "value": decisions.get(action, "UNKNOWN"), "pass": action >= 1},
             {"name": "Outcome", "value": outcome or "--", "pass": True},
             {"name": "Entropy", "value": f"{entropy:.2f}", "pass": entropy >= config.ENTROPY_THRESHOLD},
             {"name": "Entropy delta", "value": f"{abs(delta):.2f}", "pass": abs(delta) >= config.ENTROPY_DELTA_THRESHOLD},
         ]
-        if explanation:
-            factors.append({"name": "Explanation", "value": explanation[:80], "pass": True})
+        if threat_score is not None:
+            factors.append({
+                "name": "Threat score",
+                "value": f"{threat_score:.0f}/100",
+                "pass": threat_score >= 70 or escalated,
+            })
+        if escalation:
+            factors.append({"name": "Escalated by", "value": escalation, "pass": True})
+        if reasons:
+            factors.append({"name": "Reasons", "value": reasons[:90], "pass": True})
 
         return jsonify({
             "decision": decisions.get(action, "UNKNOWN"),
+            "action": action,
             "confidence": confidence,
             "engine": engine,
+            "escalated": escalated,
+            "escalation": escalation,
+            "threat_score": threat_score,
+            "entropy": entropy,
+            "entropy_delta": delta,
             "explanation": explanation,
+            "reasons": reasons,
             "factors": factors
         })
     except Exception:
@@ -709,6 +787,9 @@ def flagged_processes():
                 pid,
                 COUNT(*) AS hits,
                 MAX(action) AS max_action,
+                SUM(CASE WHEN status LIKE 'TERMINATED%' THEN 1 ELSE 0 END)
+                    AS kills,
+                MAX(status) AS last_status,
                 MAX(entropy) AS max_ent
             FROM events
             WHERE action >= 1
@@ -718,11 +799,19 @@ def flagged_processes():
         """).fetchall()
         db.close()
 
+        # A process is only "killed" when a kill really happened: the
+        # never-kill / identity gates refuse terminations and record
+        # TERMINATE_REFUSED, which must not read as a successful kill.
         return jsonify([{
             "name": r["name"] or "unknown",
             "pid": r["pid"],
             "hits": r["hits"],
-            "status": "killed" if r["max_action"] >= 2 else "watch",
+            "status": "killed" if (r["kills"] or 0) > 0 else (
+                "contained" if (r["max_action"] or 0) >= 2 else "watch"),
+            "kill_refused": bool(
+                (r["kills"] or 0) == 0
+                and str(r["last_status"] or "").startswith("TERMINATE_REFUSED")
+            ),
             "entropy": r["max_ent"] or 0
         } for r in rows])
     except Exception:

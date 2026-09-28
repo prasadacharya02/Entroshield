@@ -127,6 +127,60 @@ while working on the front-end) meant an attack ran to completion: files stayed
 encrypted, nothing reached `quarantine_storage/`, and the SOC dashboard showed
 `0 events / 0 threats` forever.
 
+## 🚫 Never-Kill List (User/OS Software Is Off-Limits)
+
+Real Windows software keeps legitimate open handles on user files: the Search
+indexer (`SearchFilterHost.exe`, `SearchIndexer.exe`), the COM surrogate
+(`dllhost.exe`), browsers, sync clients and Office. Plain "which process holds
+this file open?" attribution therefore accused them during an attack, and the
+SOC process monitor showed `chrome.exe` / `dllhost.exe` /
+`SearchFilterHost.exe` as **KILLED**.
+
+`config.DENY_KILL_PROCESSES` + `config.is_denied_process()` now enforce a
+never-kill list (case-insensitive, basename-aware, `search*host.exe` pattern)
+at **three** layers:
+
+1. **Attribution** (`monitoring/watchdog_monitor._find_by_open_file`) - a
+   denied holder is skipped with an `[ATTRIBUTION]` log line and the youngest
+   non-denied holder wins; if every holder is denied the attribution is
+   rejected instead of guessed.
+2. **Campaign kill memory** (`CampaignTracker`) - a denied process is never
+   remembered as "the attacker" for later sweep kills.
+3. **Termination gate** (`pipeline_runner._terminate_process` and
+   `ProcessTerminator.terminate`) - even a "verified" identity is refused,
+   including after re-reading the process name.
+
+The list covers Windows shell/search/COM (`dllhost`, `SearchFilterHost`,
+`RuntimeBroker`, `sihost`, `wmiprvse`, `dwm`, `winlogon`, `conhost`), browsers
+(`chrome`, `msedge`, `firefox`, `brave`, `opera`, `vivaldi`), sync clients
+(`OneDrive`, `Dropbox`, `Teams`, `Zoom`, `Slack`, `Discord`), Office
+(`winword`, `excel`, `powerpnt`, `outlook`, `acrobat`), EDR
+(`MsMpEng`, `NisSrv`, `mpcmdrun`, `avp`) and the macOS/Linux equivalents. The
+lab's own attacker engines are deliberately *not* on the list.
+
+If attribution cannot identify the writer at all (best-effort guess), the event
+is recorded as `unattributed` with no PID rather than naming an innocent
+process in the SOC.
+
+## 📊 SOC Coherence (No Self-Contradicting Panels)
+
+- Every counter describes **what happened**, not what was requested:
+  `/api/stats` reports `terminated` only for real kills and exposes
+  `terminate_refused`, `quarantined`, `recovery`, `unattributed`;
+  the process monitor returns `killed` / `contained` (+ `kill_refused`)
+  instead of claiming a kill the safety gates refused.
+- Events store the honest status (`TERMINATED+QUARANTINED`,
+  `TERMINATE_REFUSED+QUARANTINED`, ...) next to the requested action, and
+  `threat_score` (schema v5, auto-migrated).
+- `/api/dqn/last` returns the action actually taken, the persisted threat
+  score, and *why* the safety layer escalated
+  (`{"decision", "action", "confidence", "engine", "escalated", "escalation",
+  "threat_score", "entropy", "explanation", "reasons", "factors": [...]}`),
+  so "TERMINATE + QUARANTINE · 100%" is never shown beside
+  "Decision: IGNORE · Threat score 0/100".
+- `/api/entropy` hides unreadable (0 / NULL entropy) rows by default, which
+  removes the 0↔8 sawtooth; `?include_unread=1` returns the raw series.
+
 ## 🛡️ Quarantine Decryption - Brutally Honest
 
 **Can privileged user decrypt quarantine files? NO.**
@@ -153,7 +207,7 @@ os.makedirs(QUARANTINE_DIR, exist_ok=True)  # in install.py + lab.py
 
 ```bash
 pip install -r requirements-ci.txt
-python -m unittest discover -s tests  # 185 tests, 0 fail
+python -m unittest discover -s tests  # 218 tests, 0 fail
 ```
 
 ## 📚 Docs
@@ -172,6 +226,8 @@ python -m unittest discover -s tests  # 185 tests, 0 fail
 - [x] Process killed (verified PID, instant, no force-kill)
 - [x] File moved to quarantine folder created at install
 - [x] 18/18 restored, 0 .WNCRY, forensic reports, blockchain ledger
+- [x] Never-kill list: user/OS software is never terminated (3 enforcement layers)
+- [x] Honest SOC: counters, process monitor and decision panel agree with what happened
 - [x] No bugs, end-to-end working, honest documentation
 - [x] Industry level: SHA3-256, campaign escalation, strict restore, post-kill verification
 
