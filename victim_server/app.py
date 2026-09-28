@@ -15,6 +15,7 @@ ROOT_DIR = os.path.dirname(BASE_DIR)
 sys.path.insert(0, ROOT_DIR)
 import config
 from catalog import LOCK_EXTENSIONS, family_from_filename
+from monitoring import pipeline_supervisor
 
 # Paths
 USER_FILES = os.path.join(BASE_DIR, "user_files")
@@ -451,4 +452,13 @@ if __name__ == "__main__":
     print(f"  Quarantine: {QUARANTINE_FILES} (privileged)")
     print(f"  Vault User: {VAULT_USER} | PIN: {VAULT_PIN}")
     print("=" * 60)
+
+    # The explorer is the asset under attack: guarantee the detection
+    # pipeline (monitor → entropy → kill → quarantine → restore) is
+    # running even when only the web surfaces were started by hand.
+    pipeline_supervisor.ensure_pipeline("victim explorer startup")
+    pipeline_supervisor.wait_for_pipeline(timeout=8.0)
+    pipeline_supervisor.print_status()
+    pipeline_supervisor.start_supervisor()
+
     app.run(host=host, port=port, debug=False)

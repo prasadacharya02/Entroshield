@@ -155,6 +155,15 @@ def simulate_scenario(scenario, *, baseline: bool, root: Path,
             "events_per_sec": rate,
             "is_suspicious_speed": rate >= config.FILES_PER_SECOND_THRESHOLD,
             "ext_changed": ext_changed,
+            # Structural fingerprint — the same two signals the live
+            # monitor forwards (EventPipeline._merge_event). Without
+            # them the benchmark could not exercise the rule that
+            # contains an encrypted file renamed to a never-seen
+            # extension on first sight.
+            "chi2_uniformity": result.get("chi2_uniformity"),
+            "chi2_tail": result.get("chi2_tail"),
+            "magic_ok": result.get("magic_ok", True),
+            "file_size": result.get("file_size"),
         }
         # Identical hard-confirmation signal collection as the live
         # pipeline (EventPipeline._merge_event). The benchmark passes an

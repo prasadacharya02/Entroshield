@@ -95,6 +95,38 @@ python -m benchmark.recovery_drill
 
 **Why 87.5% not 100%?** `image_blindspot` - in-place encryption of jpg/mp4 without rename leaves entropy in normal range. No entropy-only detector can catch it. Published openly as limitation. RF closes it but breaks 0-FQ bar.
 
+## 🔌 Backend always runs (self-starting detection pipeline)
+
+The lab has **four** processes, but only three have a UI:
+
+| Process | Port | Role |
+|---------|------|------|
+| `monitoring/pipeline_runner.py` | — | **The defence**: monitor → entropy → decision → kill → quarantine → restore |
+| `app.py` (SOC) | 5000 | Analyst console |
+| `victim_server/app.py` | 5001 | Victim file explorer |
+| `attacker_server/app.py` | 8001 | Attack simulator |
+
+Starting the SOC dashboard or the victim explorer **starts the detection
+pipeline too, and keeps it alive** (`monitoring/pipeline_supervisor.py`):
+
+- heartbeat-based: never starts a second pipeline while one is running
+- self-healing: restarts the pipeline within seconds if it dies or hangs
+- scope-checked: restarts it if it stopped watching `victim_server/user_files`
+- `victim_server/user_files` is always watched, whatever `ENTROPY_WATCH_FOLDERS`
+  says (`ENTROPY_WATCH_VICTIM=false` opts out)
+- opt out entirely with `ENTROPY_AUTOSTART_PIPELINE=false`
+
+```bash
+python -m monitoring.pipeline_supervisor status    # is the defence running?
+python -m monitoring.pipeline_supervisor restart   # start/restart it
+curl -X POST http://127.0.0.1:5000/api/pipeline/restart   # from the SOC UI
+```
+
+Without this, launching only the three web surfaces (the natural thing to do
+while working on the front-end) meant an attack ran to completion: files stayed
+encrypted, nothing reached `quarantine_storage/`, and the SOC dashboard showed
+`0 events / 0 threats` forever.
+
 ## 🛡️ Quarantine Decryption - Brutally Honest
 
 **Can privileged user decrypt quarantine files? NO.**
@@ -121,7 +153,7 @@ os.makedirs(QUARANTINE_DIR, exist_ok=True)  # in install.py + lab.py
 
 ```bash
 pip install -r requirements-ci.txt
-python -m unittest discover -s tests  # 126 tests, 0 fail
+python -m unittest discover -s tests  # 185 tests, 0 fail
 ```
 
 ## 📚 Docs
@@ -145,11 +177,12 @@ python -m unittest discover -s tests  # 126 tests, 0 fail
 
 ## 🔧 Troubleshooting
 
-- **SOC dashboard shows no events** - look at the status banner at the top of the SOC page:
-  - `DETECTION PIPELINE OFFLINE` → the monitor is not running; start everything with `python lab.py`
-  - `NOT WATCHING VICTIM FOLDER` → `ENTROPY_WATCH_FOLDERS` points elsewhere (`lab.py` now always adds `victim_server/user_files`)
+- **SOC dashboard shows no events / attack finishes without a kill** - look at the status banner at the top of the SOC page:
+  - `DETECTION PIPELINE OFFLINE` → the monitor is not running. Starting the SOC dashboard or the victim explorer auto-starts it; if you disabled that (`ENTROPY_AUTOSTART_PIPELINE=false`) start everything with `python lab.py`
+  - `NOT WATCHING VICTIM FOLDER` → `ENTROPY_WATCH_FOLDERS` points elsewhere; the victim folder is always added unless `ENTROPY_WATCH_VICTIM=false`
   - `MONITORING · DRY-RUN` → `ENTROPY_DRY_RUN=true` (e.g. from a `.env` copied from `.env.example`): attacks are detected and logged, but no kill/quarantine happens
-  - `curl http://127.0.0.1:5000/api/pipeline` shows the same status as JSON
+  - `curl http://127.0.0.1:5000/api/pipeline` shows the same status as JSON; `curl -X POST http://127.0.0.1:5000/api/pipeline/restart` forces a restart
+- **Attack executes but no files are quarantined** → `curl http://127.0.0.1:5000/api/pipeline` and check `watching_victim`; also confirm the pipeline log: `tail -f logs/pipeline_managed.log`
 
 - `Ganache not reachable` - OK, fallback ledger active (set `ENTROPY_BLOCKCHAIN_FALLBACK=true` default)
 - `DQN unavailable` - OK, rule engine default (install torch for DQN)

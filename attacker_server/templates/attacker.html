@@ -202,10 +202,16 @@
       if(state.followLog) $("log").scrollTop = $("log").scrollHeight;
     } catch(e) { setError("node offline"); }
   }
+  // The console server substitutes these with the real sibling URLs
+  // (victim explorer :5001, SOC dashboard :5000). They used to be
+  // hardcoded to a dead port (8002), which nothing listens on.
+  const VICTIM_URL = "__VICTIM_URL__";
+  const SOC_URL = "__DASHBOARD_URL__";
   function setupLinks(){
     const h=location.hostname, p=location.protocol;
-    $("victim-link").href=`${p}//${h}:8002`;
-    $("soc-link").href=`${p}//${h}:5000`;
+    const injected = (v, fallback) => (v && v.indexOf("__") !== 0) ? v : fallback;
+    $("victim-link").href = injected(VICTIM_URL, `${p}//${h}:5001`);
+    $("soc-link").href = injected(SOC_URL, `${p}//${h}:5000`);
   }
   $("log").addEventListener("scroll",()=>{ const el=$("log"); state.followLog = el.scrollHeight-el.scrollTop-el.clientHeight<16; });
   setupLinks(); loadFamilies(); poll(); setInterval(poll,700);

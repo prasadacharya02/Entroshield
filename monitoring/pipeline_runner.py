@@ -242,6 +242,28 @@ def make_decision(event: dict) -> int:
     if (magic_bad or ciphertext_struct) and score >= 50:
         return config.ACTION_TERMINATE_QUARANTINE
 
+    # ── Extension-independent structural fingerprint ──────────────
+    # Uniformly distributed bytes at near-maximum entropy: no
+    # legitimate file of ANY extension looks like that, because every
+    # real format carries structure (magic headers, tables, text,
+    # Huffman peaks) that shows up as chi² in the thousands. Ciphertext
+    # is flat (chi² ≈ 256).
+    #
+    # Combined with evidence of the ransomware pattern — the file was
+    # RENAMED to a new extension (disguise), or its declared extension
+    # is a format whose structural header was destroyed — this contains
+    # the file on FIRST sight instead of waiting for a second victim
+    # file: that wait is exactly what lets a fast encoder run through
+    # the rest of the estate.
+    #
+    # A brand-new file with an unfamiliar extension that merely looks
+    # uniform stays an ALERT: it can be an arbitrary new binary format,
+    # and there is no disguise evidence yet. The campaign layer and the
+    # federated exchange still escalate real multi-file attacks.
+    if (any_ciphertext_shape and score >= 40
+            and (ext_chg or ciphertext_struct)):
+        return config.ACTION_TERMINATE_QUARANTINE
+
     # A high score without corroboration is only an alert.
     if score >= 40:
         return config.ACTION_ALERT

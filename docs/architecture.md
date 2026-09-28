@@ -51,6 +51,27 @@ monitoring.event_pipeline.EventPipeline (queue 10000, batch 50)
 4. `FileMonitor`: watch victim_server/user_files + protected stores (backup/quarantine deletion = tamper signal)
 5. Dashboard (5000), Victim (5001), Attacker (8001) Flask + socketio threading mode
 
+### Pipeline Supervision (`monitoring/pipeline_supervisor.py`)
+
+The defence is a separate process from the three UI surfaces, so it is easy to
+leave it out when starting only the web apps — the attack then completes and the
+SOC dashboard stays at 0 events. The supervisor removes that failure mode:
+
+- `pipeline_status()` reads the shared `pipeline_status` heartbeat row
+  (written every 2s by the pipeline) → cross-process liveness.
+- Starting the SOC dashboard or the victim explorer calls
+  `ensure_pipeline()`; a background thread re-checks every 3s and restarts the
+  pipeline if it dies, hangs (live process, no heartbeat for 30s), or is found
+  not watching `victim_server/user_files`.
+- Duplicate-start protection: fresh heartbeat, the process table (a pipeline
+  that is still importing), a 15s cross-process spawn guard, and the
+  `ENTROPY_PIPELINE_MANAGED=1` recursion flag.
+- `victim_server/user_files` is always in `config.WATCH_FOLDERS`
+  (`ENTROPY_WATCH_VICTIM=false` opts out).
+- Opt out of supervision entirely with `ENTROPY_AUTOSTART_PIPELINE=false`.
+- Endpoints: `GET /api/pipeline` (status), `POST /api/pipeline/restart`.
+- CLI: `python -m monitoring.pipeline_supervisor [status|start|restart|watch]`.
+
 ### Key Fixes for Industry Level (Final Year)
 
 - **Campaign escalation**: slow realistic attacks (1.6 ev/s) never trip speed bar, but 2 files with encrypted signatures in 15s triggers TERMINATE+QUARANTINE at file 2

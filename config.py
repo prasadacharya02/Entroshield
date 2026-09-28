@@ -126,17 +126,40 @@ ensure_runtime_directories()
 
 # ── Watch Folders ────────────────────────────────────────────
 # Accepts comma-separated (lab.py convention) OR os.pathsep-separated lists.
+#
+# The victim estate (``victim_server/user_files``) is the asset the whole
+# lab defends, so it is ALWAYS watched — even when ENTROPY_WATCH_FOLDERS
+# is empty (a .env copied from .env.example ships it empty) or lists
+# unrelated folders. Without this guarantee the monitor silently watched
+# ``data/testing`` while the SOC dashboard reported 0 events and an
+# attack on the victim PC ran to completion unopposed.
+#
+# Set ENTROPY_WATCH_VICTIM=false only if you deliberately want the
+# pipeline to ignore the victim estate (e.g. a custom deployment).
+WATCH_VICTIM = _env_bool("ENTROPY_WATCH_VICTIM", True)
+
+
 def _watch_folders() -> list[str]:
     raw = os.getenv("ENTROPY_WATCH_FOLDERS")
-    if raw is None or not raw.strip():
-        return [TESTING_DATA_DIR]
+
     # split on both comma and os.pathsep for cross-platform convenience
     parts: list[str] = []
-    for chunk in raw.replace(";", ",").split(","):
-        chunk = chunk.strip()
-        if chunk:
-            parts.append(_resolve_path(chunk))
-    return parts or [TESTING_DATA_DIR]
+    if raw and raw.strip():
+        for chunk in raw.replace(";", ",").split(","):
+            chunk = chunk.strip()
+            if chunk:
+                parts.append(_resolve_path(chunk))
+    if not parts:
+        parts = [TESTING_DATA_DIR]
+
+    # Read the switch here (not just at import) so the module-level
+    # constant and the parsed list can never disagree.
+    if _env_bool("ENTROPY_WATCH_VICTIM", True):
+        victim = str(Path(VICTIM_USER_FILES).resolve())
+        resolved = {str(Path(p).resolve()) for p in parts}
+        if victim not in resolved:
+            parts.insert(0, victim)
+    return parts
 
 
 WATCH_FOLDERS = _watch_folders()
@@ -232,6 +255,26 @@ CONTROL_TOKEN = (
     or os.getenv("CONTROL_TOKEN")
     or ""
 ).strip()
+
+# ── Detection Pipeline Supervision ───────────────────────────
+# The pipeline is the process that actually kills the attacker and
+# moves files to quarantine. Starting a web surface (SOC dashboard or
+# victim explorer) also starts it and keeps it alive, so the backend
+# can never be "quietly missing" during a demo.
+AUTOSTART_PIPELINE = _env_bool("ENTROPY_AUTOSTART_PIPELINE", True)
+# A heartbeat older than this counts as "pipeline is not running".
+PIPELINE_STALE_SECONDS = _env_float(
+    "ENTROPY_PIPELINE_STALE_SECONDS", 8.0, minimum=2.0
+)
+# How often the supervisor re-checks the pipeline.
+PIPELINE_SUPERVISOR_INTERVAL = _env_float(
+    "ENTROPY_PIPELINE_SUPERVISOR_INTERVAL", 3.0, minimum=0.5
+)
+# Minimum delay between pipeline start attempts (backs off when the
+# pipeline keeps crashing).
+PIPELINE_RESTART_COOLDOWN = _env_float(
+    "ENTROPY_PIPELINE_RESTART_COOLDOWN", 10.0, minimum=1.0
+)
 
 # ── Privileged Vault Access (Victim UI) ──────────────────────
 VAULT_USER = os.getenv("ENTROPY_VAULT_USER", "victim_user")

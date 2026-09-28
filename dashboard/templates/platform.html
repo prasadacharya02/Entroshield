@@ -300,10 +300,11 @@ async function loadFamilies(){
 }
 $('btn-stop').onclick = async () => { await j('/api/lab/stop', {method:'POST'}); refresh(); };
 $('btn-reset').onclick = async () => { await j('/api/lab/reset', {method:'POST'}); refresh(); };
-const proto = location.protocol;
-const host = location.hostname;
-$("link-victim").href = proto + "//" + host + ":8002";
-$("link-attacker").href = proto + "//" + host + ":8001";
+// Sibling-service links are rendered by the dashboard server, which
+// derives them from this request (scheme + host). Hardcoded ports here
+// pointed the victim link at a dead port (8002).
+$("link-victim").href = {{ victim_url | tojson }};
+$("link-attacker").href = {{ attacker_url | tojson }};
 loadFamilies();
 refresh();
 setInterval(refresh, 2000);

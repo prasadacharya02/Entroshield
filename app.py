@@ -17,6 +17,7 @@ sys.path.insert(0, BASE_DIR)
 
 # ── Import config and modules ───────────
 import config
+from monitoring import pipeline_supervisor
 from storage.database import connect, init_db as initialize_database
 from storage.database import read_pipeline_heartbeat
 from blockchain.connector import BlockchainConnector
@@ -73,10 +74,36 @@ def index():
     return render_template("dashboard.html")
 
 
+def _is_bind_address(url: str | None) -> bool:
+    """True for URLs that name a bind address (0.0.0.0 / ::) — not browsable."""
+    if not url:
+        return True
+    return "//0.0.0.0" in url or "//[::]" in url or "//::" in url
+
+
+def _public_base_url(port: int, explicit: str | None = None) -> str:
+    """Browser-reachable URL for a sibling service on the same host.
+
+    Mirrors the request (scheme + hostname), so links keep working
+    locally (127.0.0.1) and behind a preview proxy alike. An explicit
+    PUBLIC_* override wins when it names a real host.
+    """
+    if explicit and not _is_bind_address(explicit):
+        return explicit
+    host = request.host.split(":", 1)[0] or "127.0.0.1"
+    return f"{request.scheme}://{host}:{port}"
+
+
 @app.route("/platform")
 def platform_dashboard():
     """Secondary route for Command Platform."""
-    return render_template("platform.html")
+    return render_template(
+        "platform.html",
+        victim_url=_public_base_url(config.VICTIM_PORT,
+                                    config.PUBLIC_VICTIM_URL),
+        attacker_url=_public_base_url(config.ATTACKER_PORT,
+                                      config.PUBLIC_ATTACKER_URL),
+    )
 
 
 @app.route("/api/platform")
@@ -136,6 +163,29 @@ def pipeline_status() -> dict:
 @app.route("/api/pipeline")
 def pipeline():
     return jsonify(pipeline_status())
+
+
+@app.route("/api/pipeline/restart", methods=["POST"])
+def pipeline_restart():
+    """Start (or restart) the detection pipeline from the SOC dashboard.
+
+    The supervisor thread normally does this automatically; this route
+    exists so an analyst can force it from the UI without touching the
+    terminal.
+    """
+    status = pipeline_status()
+    if status["online"] and status["watching_victim"]:
+        return jsonify({"status": "already-running", "pipeline": status})
+    if status["online"]:
+        started = pipeline_supervisor.restart_pipeline(
+            "manual restart from the SOC dashboard")
+    else:
+        started = pipeline_supervisor.start_pipeline(
+            "manual start from the SOC dashboard")
+    return jsonify({
+        "status": "started" if started else "unavailable",
+        "pipeline": pipeline_status(),
+    }), (200 if started else 503)
 
 
 @app.route("/api/health")
@@ -473,6 +523,123 @@ def push_updates():
 # DQN + PROCESSES + DEMO + THREAT LEVEL
 # ═══════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════
+# LAB CONTROL — the Command Platform page drives the
+# attacker console through these routes
+# ═══════════════════════════════════════════════════
+# The console (attacker_server, port 8001) owns the campaign process.
+# The SOC dashboard proxies to it server-side, so the operator does not
+# have to paste the control token into a second UI — the same token the
+# console would demand is attached here.
+
+LAB_FOLDER_NAMES = ("Documents", "Downloads", "Desktop", "Pictures")
+
+
+def _attacker_console(path: str, method: str = "GET",
+                      payload: dict | None = None,
+                      timeout: float = 6.0):
+    """Call the attacker console. Returns (json|None, status_code)."""
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{config.ATTACKER_PORT}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if config.CONTROL_TOKEN:
+        req.add_header("Authorization", f"Bearer {config.CONTROL_TOKEN}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8")), response.status
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8")), exc.code
+        except Exception:
+            return {"ok": False, "error": f"console returned {exc.code}"}, exc.code
+    except Exception:
+        return None, 0
+
+
+def _console_offline():
+    return jsonify({
+        "ok": False,
+        "error": ("attacker console is not reachable on port "
+                  f"{config.ATTACKER_PORT} — start it with: "
+                  "python attacker_server/app.py"),
+    }), 503
+
+
+@app.route("/api/lab/status")
+def lab_status():
+    """Campaign + victim state, read from the attacker console."""
+    stats, status = _attacker_console("/api/stats")
+    if stats is None:
+        return _console_offline()
+    stats = dict(stats)
+    stats["dry_run"] = bool(config.DRY_RUN)
+    return jsonify(stats), status
+
+
+@app.route("/api/lab/families")
+def lab_families():
+    families, status = _attacker_console("/api/families")
+    if families is None:
+        return _console_offline()
+    return jsonify(families), status
+
+
+@app.route("/api/lab/launch", methods=["POST"])
+def lab_launch():
+    payload = request.get_json(silent=True) or {}
+    family = str(payload.get("family") or "").strip().lower()
+    result, status = _attacker_console("/api/launch", "POST", {"family": family})
+    if result is None:
+        return _console_offline()
+    return jsonify(result), status
+
+
+@app.route("/api/lab/stop", methods=["POST"])
+def lab_stop():
+    result, status = _attacker_console("/api/stop", "POST", {})
+    if result is None:
+        return _console_offline()
+    return jsonify(result), status
+
+
+@app.route("/api/lab/reset", methods=["POST"])
+def lab_reset():
+    result, status = _attacker_console("/api/reset", "POST", {})
+    if result is None:
+        return _console_offline()
+    return jsonify(result), status
+
+
+@app.route("/api/folders")
+def victim_folders():
+    """Neutral folder inventory of the victim estate (no attack detail)."""
+    folders = []
+    root = config.VICTIM_USER_FILES
+    for name in LAB_FOLDER_NAMES:
+        path = os.path.join(root, name)
+        count, size = 0, 0
+        if os.path.isdir(path):
+            for entry in os.scandir(path):
+                if entry.is_file():
+                    count += 1
+                    try:
+                        size += entry.stat().st_size
+                    except OSError:
+                        pass
+        folders.append({
+            "name": name,
+            "file_count": count,
+            "size": f"{size / 1024:.1f} KB" if size else "0 KB",
+            "locked": False,
+        })
+    return jsonify(folders)
+
+
 @app.route("/api/dqn/last")
 def dqn_last_decision():
     try:
@@ -640,6 +807,13 @@ if __name__ == "__main__":
     print(f"            URL     → http://localhost:{config.FLASK_PORT}")
     print(f"            DB      → {config.DB_PATH}")
     print(f"            Chain   → {config.GANACHE_URL}\n")
+
+    # The dashboard is useless without the detection pipeline: make sure
+    # one is running (and keep it running) before serving the UI.
+    pipeline_supervisor.ensure_pipeline("SOC dashboard startup")
+    pipeline_supervisor.wait_for_pipeline(timeout=8.0)
+    pipeline_supervisor.print_status()
+    pipeline_supervisor.start_supervisor()
 
     socketio.run(
         app,
