@@ -17,6 +17,7 @@ sys.path.insert(0, BASE_DIR)
 
 # ── Import config and modules ───────────
 import config
+from monitoring import pipeline_supervisor
 from storage.database import connect, init_db as initialize_database
 from storage.database import read_pipeline_heartbeat
 from blockchain.connector import BlockchainConnector
@@ -73,10 +74,36 @@ def index():
     return render_template("dashboard.html")
 
 
+def _is_bind_address(url: str | None) -> bool:
+    """True for URLs that name a bind address (0.0.0.0 / ::) — not browsable."""
+    if not url:
+        return True
+    return "//0.0.0.0" in url or "//[::]" in url or "//::" in url
+
+
+def _public_base_url(port: int, explicit: str | None = None) -> str:
+    """Browser-reachable URL for a sibling service on the same host.
+
+    Mirrors the request (scheme + hostname), so links keep working
+    locally (127.0.0.1) and behind a preview proxy alike. An explicit
+    PUBLIC_* override wins when it names a real host.
+    """
+    if explicit and not _is_bind_address(explicit):
+        return explicit
+    host = request.host.split(":", 1)[0] or "127.0.0.1"
+    return f"{request.scheme}://{host}:{port}"
+
+
 @app.route("/platform")
 def platform_dashboard():
     """Secondary route for Command Platform."""
-    return render_template("platform.html")
+    return render_template(
+        "platform.html",
+        victim_url=_public_base_url(config.VICTIM_PORT,
+                                    config.PUBLIC_VICTIM_URL),
+        attacker_url=_public_base_url(config.ATTACKER_PORT,
+                                      config.PUBLIC_ATTACKER_URL),
+    )
 
 
 @app.route("/api/platform")
@@ -138,6 +165,29 @@ def pipeline():
     return jsonify(pipeline_status())
 
 
+@app.route("/api/pipeline/restart", methods=["POST"])
+def pipeline_restart():
+    """Start (or restart) the detection pipeline from the SOC dashboard.
+
+    The supervisor thread normally does this automatically; this route
+    exists so an analyst can force it from the UI without touching the
+    terminal.
+    """
+    status = pipeline_status()
+    if status["online"] and status["watching_victim"]:
+        return jsonify({"status": "already-running", "pipeline": status})
+    if status["online"]:
+        started = pipeline_supervisor.restart_pipeline(
+            "manual restart from the SOC dashboard")
+    else:
+        started = pipeline_supervisor.start_pipeline(
+            "manual start from the SOC dashboard")
+    return jsonify({
+        "status": "started" if started else "unavailable",
+        "pipeline": pipeline_status(),
+    }), (200 if started else 503)
+
+
 @app.route("/api/health")
 def health():
     return jsonify({"status": "ok", "service": "dashboard"})
@@ -147,17 +197,27 @@ def health():
 def stats():
     try:
         db  = get_db()
+        # Every counter describes what actually happened: a kill the
+        # safety gates refused is recorded as a refusal, never as a
+        # kill, and a failed restore is not a recovery.
         row = db.execute("""
             SELECT
                 COUNT(*)                    AS total,
                 SUM(CASE WHEN action >= 1
                     THEN 1 ELSE 0 END)      AS threats,
-                SUM(CASE WHEN action >= 2
+                SUM(CASE WHEN status LIKE 'TERMINATED%'
                     THEN 1 ELSE 0 END)      AS terminated,
-                SUM(CASE WHEN action = 3
+                SUM(CASE WHEN status LIKE 'TERMINATE_REFUSED%'
+                    THEN 1 ELSE 0 END)      AS terminate_refused,
+                SUM(CASE WHEN outcome LIKE '%QUARANTIN%'
+                    AND outcome NOT LIKE '%FAILED%'
+                    AND outcome NOT LIKE '%PARTIAL%'
                     THEN 1 ELSE 0 END)      AS quarantined,
-                SUM(CASE WHEN restore_result IS NOT NULL
+                SUM(CASE WHEN restore_result IN
+                    ('RESTORED', 'DRY_RUN_RESTORE')
                     THEN 1 ELSE 0 END)      AS recovery,
+                SUM(CASE WHEN process_name = 'unattributed'
+                    THEN 1 ELSE 0 END)      AS unattributed,
                 ROUND(AVG(entropy), 2)      AS avg_entropy,
                 ROUND(MAX(entropy), 2)      AS max_entropy
             FROM events
@@ -167,14 +227,16 @@ def stats():
         bc_count = bc.get_event_count()
 
         return jsonify({
-            "total"        : row["total"]       or 0,
-            "threats"      : row["threats"]     or 0,
-            "terminated"   : row["terminated"]  or 0,
-            "quarantined"  : row["quarantined"] or 0,
-            "recovery"     : row["recovery"]    or 0,
-            "avg_entropy"  : row["avg_entropy"] or 0,
-            "max_entropy"  : row["max_entropy"] or 0,
-            "blockchain_tx": bc_count
+            "total"            : row["total"]             or 0,
+            "threats"          : row["threats"]           or 0,
+            "terminated"       : row["terminated"]        or 0,
+            "terminate_refused": row["terminate_refused"] or 0,
+            "quarantined"      : row["quarantined"]       or 0,
+            "recovery"         : row["recovery"]          or 0,
+            "unattributed"     : row["unattributed"]      or 0,
+            "avg_entropy"      : row["avg_entropy"]       or 0,
+            "max_entropy"      : row["max_entropy"]       or 0,
+            "blockchain_tx"    : bc_count
         })
     except Exception:
         log.exception("Stats API failed")
@@ -199,11 +261,21 @@ def events():
 
 @app.route("/api/entropy")
 def entropy_data():
+    """Entropy time series for the SOC graph.
+
+    Rows the analyzer could not read (a DELETED/RENAMED event, a file
+    locked mid-write) carry entropy 0. Plotting those produced a
+    meaningless 0 ↔ 8 sawtooth that hid the real spikes. They are
+    excluded unless ``?include_unread=1`` is passed explicitly.
+    """
     try:
+        include_unread = request.args.get("include_unread") in {"1", "true", "yes"}
+        where = "" if include_unread else "WHERE entropy IS NOT NULL AND entropy > 0"
         db   = get_db()
-        rows = db.execute("""
+        rows = db.execute(f"""
             SELECT timestamp, entropy, entropy_delta, file_path
             FROM events
+            {where}
             ORDER BY id DESC
             LIMIT 100
         """).fetchall()
@@ -473,6 +545,123 @@ def push_updates():
 # DQN + PROCESSES + DEMO + THREAT LEVEL
 # ═══════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════
+# LAB CONTROL — the Command Platform page drives the
+# attacker console through these routes
+# ═══════════════════════════════════════════════════
+# The console (attacker_server, port 8001) owns the campaign process.
+# The SOC dashboard proxies to it server-side, so the operator does not
+# have to paste the control token into a second UI — the same token the
+# console would demand is attached here.
+
+LAB_FOLDER_NAMES = ("Documents", "Downloads", "Desktop", "Pictures")
+
+
+def _attacker_console(path: str, method: str = "GET",
+                      payload: dict | None = None,
+                      timeout: float = 6.0):
+    """Call the attacker console. Returns (json|None, status_code)."""
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{config.ATTACKER_PORT}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if config.CONTROL_TOKEN:
+        req.add_header("Authorization", f"Bearer {config.CONTROL_TOKEN}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8")), response.status
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8")), exc.code
+        except Exception:
+            return {"ok": False, "error": f"console returned {exc.code}"}, exc.code
+    except Exception:
+        return None, 0
+
+
+def _console_offline():
+    return jsonify({
+        "ok": False,
+        "error": ("attacker console is not reachable on port "
+                  f"{config.ATTACKER_PORT} — start it with: "
+                  "python attacker_server/app.py"),
+    }), 503
+
+
+@app.route("/api/lab/status")
+def lab_status():
+    """Campaign + victim state, read from the attacker console."""
+    stats, status = _attacker_console("/api/stats")
+    if stats is None:
+        return _console_offline()
+    stats = dict(stats)
+    stats["dry_run"] = bool(config.DRY_RUN)
+    return jsonify(stats), status
+
+
+@app.route("/api/lab/families")
+def lab_families():
+    families, status = _attacker_console("/api/families")
+    if families is None:
+        return _console_offline()
+    return jsonify(families), status
+
+
+@app.route("/api/lab/launch", methods=["POST"])
+def lab_launch():
+    payload = request.get_json(silent=True) or {}
+    family = str(payload.get("family") or "").strip().lower()
+    result, status = _attacker_console("/api/launch", "POST", {"family": family})
+    if result is None:
+        return _console_offline()
+    return jsonify(result), status
+
+
+@app.route("/api/lab/stop", methods=["POST"])
+def lab_stop():
+    result, status = _attacker_console("/api/stop", "POST", {})
+    if result is None:
+        return _console_offline()
+    return jsonify(result), status
+
+
+@app.route("/api/lab/reset", methods=["POST"])
+def lab_reset():
+    result, status = _attacker_console("/api/reset", "POST", {})
+    if result is None:
+        return _console_offline()
+    return jsonify(result), status
+
+
+@app.route("/api/folders")
+def victim_folders():
+    """Neutral folder inventory of the victim estate (no attack detail)."""
+    folders = []
+    root = config.VICTIM_USER_FILES
+    for name in LAB_FOLDER_NAMES:
+        path = os.path.join(root, name)
+        count, size = 0, 0
+        if os.path.isdir(path):
+            for entry in os.scandir(path):
+                if entry.is_file():
+                    count += 1
+                    try:
+                        size += entry.stat().st_size
+                    except OSError:
+                        pass
+        folders.append({
+            "name": name,
+            "file_count": count,
+            "size": f"{size / 1024:.1f} KB" if size else "0 KB",
+            "locked": False,
+        })
+    return jsonify(folders)
+
+
 @app.route("/api/dqn/last")
 def dqn_last_decision():
     try:
@@ -501,6 +690,11 @@ def dqn_last_decision():
         confidence = row["confidence"] if "confidence" in keys and row["confidence"] is not None else 0
         if isinstance(confidence, float) and confidence <= 1:
             confidence = round(confidence * 100, 1)
+        threat_score = (
+            float(row["threat_score"])
+            if "threat_score" in keys and row["threat_score"] is not None
+            else None
+        )
 
         decisions = {
             0: "IGNORE",
@@ -510,21 +704,72 @@ def dqn_last_decision():
         }
         outcome = row["outcome"] if "outcome" in keys and row["outcome"] else row["status"]
 
+        # ── Was this the engine's own verdict, or an escalation? ──
+        # Everything above the engine (campaign confirmation, ransom
+        # note, defense tamper, exchange confirmation, post-kill
+        # verification, campaign sweep) can raise the action beyond the
+        # per-file score. The panel must say which one it was — showing
+        # "TERMINATE + QUARANTINE" next to an engine line that reads
+        # "Decision: ALERT | Threat score: 0/100" is exactly the
+        # confusion this avoids.
+        escalated, escalation = False, ""
+        text = str(explanation or "")
+        for marker, label in (
+            ("CAMPAIGN CONFIRMED", "Campaign confirmed (multiple files)"),
+            ("Campaign sweep", "Campaign sweep (containment of touched files)"),
+            ("Post-kill verification", "Post-kill verification (repair pass)"),
+            ("Hard-confirmation signal", "Hard confirmation signal"),
+            ("DEFENSE TAMPER", "Defence tamper (recovery destroyed)"),
+            ("RANSOM NOTE", "Ransom note dropped"),
+            ("CONFIRMED BY EXCHANGE", "Confirmed by the federated exchange"),
+            ("Ciphertext fingerprint", "Ciphertext fingerprint (chi² uniformity)"),
+            ("Magic-byte mismatch", "Magic-byte mismatch (header destroyed)"),
+        ):
+            if marker in text:
+                escalated, escalation = True, label
+                break
+        if not escalated and action >= 2 and threat_score is not None \
+                and threat_score < 70:
+            escalated, escalation = True, "Safety-layer escalation"
+
+        # Reasons = the engine's own trailing summary, if it has one.
+        engine_opinion = text.rsplit("|", 1)[-1].strip() if "|" in text else text
+        reasons = ""
+        if "Reasons:" in text:
+            reasons = text.split("Reasons:", 1)[1].strip()
+        elif engine_opinion and not engine_opinion.startswith("Campaign"):
+            reasons = engine_opinion
+
         factors = [
-            {"name": "Engine", "value": engine, "pass": engine == "dqn"},
-            {"name": "Requested action", "value": decisions.get(action, "UNKNOWN"), "pass": action >= 1},
+            {"name": "Engine", "value": engine, "pass": engine in ("rules", "rf", "dqn")},
+            {"name": "Action taken", "value": decisions.get(action, "UNKNOWN"), "pass": action >= 1},
             {"name": "Outcome", "value": outcome or "--", "pass": True},
             {"name": "Entropy", "value": f"{entropy:.2f}", "pass": entropy >= config.ENTROPY_THRESHOLD},
             {"name": "Entropy delta", "value": f"{abs(delta):.2f}", "pass": abs(delta) >= config.ENTROPY_DELTA_THRESHOLD},
         ]
-        if explanation:
-            factors.append({"name": "Explanation", "value": explanation[:80], "pass": True})
+        if threat_score is not None:
+            factors.append({
+                "name": "Threat score",
+                "value": f"{threat_score:.0f}/100",
+                "pass": threat_score >= 70 or escalated,
+            })
+        if escalation:
+            factors.append({"name": "Escalated by", "value": escalation, "pass": True})
+        if reasons:
+            factors.append({"name": "Reasons", "value": reasons[:90], "pass": True})
 
         return jsonify({
             "decision": decisions.get(action, "UNKNOWN"),
+            "action": action,
             "confidence": confidence,
             "engine": engine,
+            "escalated": escalated,
+            "escalation": escalation,
+            "threat_score": threat_score,
+            "entropy": entropy,
+            "entropy_delta": delta,
             "explanation": explanation,
+            "reasons": reasons,
             "factors": factors
         })
     except Exception:
@@ -542,6 +787,9 @@ def flagged_processes():
                 pid,
                 COUNT(*) AS hits,
                 MAX(action) AS max_action,
+                SUM(CASE WHEN status LIKE 'TERMINATED%' THEN 1 ELSE 0 END)
+                    AS kills,
+                MAX(status) AS last_status,
                 MAX(entropy) AS max_ent
             FROM events
             WHERE action >= 1
@@ -551,11 +799,19 @@ def flagged_processes():
         """).fetchall()
         db.close()
 
+        # A process is only "killed" when a kill really happened: the
+        # never-kill / identity gates refuse terminations and record
+        # TERMINATE_REFUSED, which must not read as a successful kill.
         return jsonify([{
             "name": r["name"] or "unknown",
             "pid": r["pid"],
             "hits": r["hits"],
-            "status": "killed" if r["max_action"] >= 2 else "watch",
+            "status": "killed" if (r["kills"] or 0) > 0 else (
+                "contained" if (r["max_action"] or 0) >= 2 else "watch"),
+            "kill_refused": bool(
+                (r["kills"] or 0) == 0
+                and str(r["last_status"] or "").startswith("TERMINATE_REFUSED")
+            ),
             "entropy": r["max_ent"] or 0
         } for r in rows])
     except Exception:
@@ -640,6 +896,13 @@ if __name__ == "__main__":
     print(f"            URL     → http://localhost:{config.FLASK_PORT}")
     print(f"            DB      → {config.DB_PATH}")
     print(f"            Chain   → {config.GANACHE_URL}\n")
+
+    # The dashboard is useless without the detection pipeline: make sure
+    # one is running (and keep it running) before serving the UI.
+    pipeline_supervisor.ensure_pipeline("SOC dashboard startup")
+    pipeline_supervisor.wait_for_pipeline(timeout=8.0)
+    pipeline_supervisor.print_status()
+    pipeline_supervisor.start_supervisor()
 
     socketio.run(
         app,

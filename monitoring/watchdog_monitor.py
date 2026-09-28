@@ -84,48 +84,84 @@ class ProcessFinder:
         pass
 
     def _find_by_open_file(self, file_path):
-        """Return the process that currently holds *file_path* open."""
+        """Return the best non-denied process holding *file_path* open.
+
+        Holding a handle is not proof of guilt: the Windows Search
+        indexer, the COM surrogate (dllhost) and a browser that just
+        downloaded the file all keep legitimate handles on user files.
+        Killing them is far worse than a late kill, so they are filtered
+        out here — if every candidate is denied, the attribution is
+        refused and the response layer never gets a kill target.
+
+        Among the remaining candidates the YOUNGEST is preferred: a
+        ransomware process is spawned for the attack, while the
+        long-lived system software is not.
+        """
         try:
             target = os.path.realpath(file_path)
         except OSError:
             return None
 
+        candidates = []
         for proc in psutil.process_iter(
             ['pid', 'name', 'create_time']
         ):
             try:
+                holds_target = False
                 for opened in proc.open_files():
                     try:
                         if os.path.realpath(opened.path) == target:
-                            info = {
-                                'pid': proc.info['pid'],
-                                'name': proc.info.get('name') or proc.name(),
-                                'create_time': proc.info.get('create_time'),
-                                'identity_verified': True,
-                            }
-                            # The command line is carried for the
-                            # response layer's safety gate: the
-                            # defender must be able to tell the
-                            # attacker's process apart from its own
-                            # software (never kill itself).
-                            try:
-                                cmdline = proc.cmdline()
-                                if cmdline:
-                                    info['cmdline'] = " ".join(
-                                        cmdline
-                                    )[:300]
-                            except (
-                                psutil.NoSuchProcess,
-                                psutil.AccessDenied,
-                                OSError,
-                            ):
-                                pass
-                            return info
+                            holds_target = True
+                            break
                     except (OSError, ValueError):
                         continue
+                if not holds_target:
+                    continue
+
+                name = proc.info.get('name') or proc.name()
+                if config.is_denied_process(name):
+                    log.info(
+                        "[ATTRIBUTION] %s holds %s open but is on the "
+                        "never-kill list — not a kill candidate",
+                        name, os.path.basename(target),
+                    )
+                    continue
+
+                create_time = proc.info.get('create_time')
+                info = {
+                    'pid': proc.info['pid'],
+                    'name': name,
+                    'create_time': create_time,
+                    'identity_verified': True,
+                }
+                if create_time:
+                    info['age_seconds'] = round(
+                        max(0.0, time.time() - create_time), 2
+                    )
+                # The command line is carried for the response layer's
+                # safety gate: the defender must be able to tell the
+                # attacker's process apart from its own software
+                # (never kill itself).
+                try:
+                    cmdline = proc.cmdline()
+                    if cmdline:
+                        info['cmdline'] = " ".join(cmdline)[:300]
+                except (
+                    psutil.NoSuchProcess,
+                    psutil.AccessDenied,
+                    OSError,
+                ):
+                    pass
+                candidates.append(info)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
-        return None
+
+        if not candidates:
+            return None
+
+        # Youngest first: the freshly spawned process is the writer.
+        candidates.sort(key=lambda c: c.get('age_seconds') or 10 ** 9)
+        return candidates[0]
 
     def _find_recent_suspicious(self, max_age_seconds=None):
         """Guess: the youngest non-whitelisted process (unverified)."""

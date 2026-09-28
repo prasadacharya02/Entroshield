@@ -7,7 +7,7 @@ from pathlib import Path
 
 import config
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _EVENTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS events (
     engine        TEXT,
     confidence    REAL,
     explanation   TEXT,
-    q_values      TEXT
+    q_values      TEXT,
+    threat_score  REAL
 )
 """
 
@@ -64,6 +65,12 @@ def _ensure_events_columns(connection: sqlite3.Connection) -> None:
         "confidence": "REAL",
         "explanation": "TEXT",
         "q_values": "TEXT",
+        # The per-file suspicion score, persisted so the SOC decision
+        # panel can show the number behind the action instead of
+        # scraping it out of the explanation text (which is produced by
+        # whichever engine decided and can disagree with the escalated
+        # action).
+        "threat_score": "REAL",
     }
     for name, definition in columns.items():
         if name not in existing:

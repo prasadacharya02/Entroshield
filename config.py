@@ -126,17 +126,40 @@ ensure_runtime_directories()
 
 # ── Watch Folders ────────────────────────────────────────────
 # Accepts comma-separated (lab.py convention) OR os.pathsep-separated lists.
+#
+# The victim estate (``victim_server/user_files``) is the asset the whole
+# lab defends, so it is ALWAYS watched — even when ENTROPY_WATCH_FOLDERS
+# is empty (a .env copied from .env.example ships it empty) or lists
+# unrelated folders. Without this guarantee the monitor silently watched
+# ``data/testing`` while the SOC dashboard reported 0 events and an
+# attack on the victim PC ran to completion unopposed.
+#
+# Set ENTROPY_WATCH_VICTIM=false only if you deliberately want the
+# pipeline to ignore the victim estate (e.g. a custom deployment).
+WATCH_VICTIM = _env_bool("ENTROPY_WATCH_VICTIM", True)
+
+
 def _watch_folders() -> list[str]:
     raw = os.getenv("ENTROPY_WATCH_FOLDERS")
-    if raw is None or not raw.strip():
-        return [TESTING_DATA_DIR]
+
     # split on both comma and os.pathsep for cross-platform convenience
     parts: list[str] = []
-    for chunk in raw.replace(";", ",").split(","):
-        chunk = chunk.strip()
-        if chunk:
-            parts.append(_resolve_path(chunk))
-    return parts or [TESTING_DATA_DIR]
+    if raw and raw.strip():
+        for chunk in raw.replace(";", ",").split(","):
+            chunk = chunk.strip()
+            if chunk:
+                parts.append(_resolve_path(chunk))
+    if not parts:
+        parts = [TESTING_DATA_DIR]
+
+    # Read the switch here (not just at import) so the module-level
+    # constant and the parsed list can never disagree.
+    if _env_bool("ENTROPY_WATCH_VICTIM", True):
+        victim = str(Path(VICTIM_USER_FILES).resolve())
+        resolved = {str(Path(p).resolve()) for p in parts}
+        if victim not in resolved:
+            parts.insert(0, victim)
+    return parts
 
 
 WATCH_FOLDERS = _watch_folders()
@@ -147,6 +170,66 @@ WHITELISTED_PROCESSES = [
     "services.exe", "lsass.exe", "svchost.exe", "systemd", "init", "kthreadd",
     "code.exe", "explorer.exe",
 ]
+
+# ── Never-kill list: ordinary user & OS software ─────────────
+# These processes routinely hold *legitimate* handles on files in a
+# user folder — the Windows Search indexer (SearchFilterHost /
+# SearchProtocolHost / SearchIndexer), the COM surrogate (dllhost),
+# browsers that just downloaded a file, OneDrive/Dropbox sync, Office,
+# the AV engine. Open-handle attribution alone therefore CANNOT prove
+# they are the writer.
+#
+# Killing any of them is a worse outcome than a late kill: it destroys
+# the operator's session and has nothing to do with the ransomware.
+# They are refused at attribution time (never offered as a candidate),
+# inside the campaign kill memory, and again at the termination gate —
+# three independent layers, so a single bad attribution cannot reach
+# os.kill().
+DENY_KILL_PROCESSES = [
+    # Windows shell / search / COM infrastructure
+    "dllhost.exe", "searchfilterhost.exe", "searchprotocolhost.exe",
+    "searchindexer.exe", "sihost.exe", "runtimebroker.exe", "wmiprvse.exe",
+    "taskhostw.exe", "ctfmon.exe", "textinputhost.exe", "dwm.exe",
+    "fontdrvhost.exe", "audiodg.exe", "spoolsv.exe", "winlogon.exe",
+    "securityhealthservice.exe", "securityhealthsystray.exe",
+    "smartscreen.exe", "backgroundtaskhost.exe", "conhost.exe",
+    # Browsers
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+    "vivaldi.exe", "iexplore.exe", "msedgewebview2.exe",
+    # Cloud sync / collaboration
+    "onedrive.exe", "dropbox.exe", "googledrivesync.exe", "teams.exe",
+    "ms-teams.exe", "zoom.exe", "slack.exe", "discord.exe",
+    # Office / PDF readers
+    "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe",
+    "acrord32.exe", "acrobat.exe", "notepad.exe", "notepad++.exe",
+    # Endpoint protection
+    "msmpeng.exe", "nissrv.exe", "mpcmdrun.exe", "avp.exe", "avastui.exe",
+    # macOS / Linux desktop equivalents
+    "finder", "google chrome", "safari", "firefox", "chromium",
+    "chromium-browser", "google-chrome", "gnome-shell", "nautilus",
+    "tracker-miner-fs", "gvfsd", "baloo_file",
+]
+
+_DENY_KILL_SET = {name.lower() for name in DENY_KILL_PROCESSES}
+
+
+def is_denied_process(process_name: str | None) -> bool:
+    """True when this process must never be auto-terminated.
+
+    Matches the full name and the basename, so both ``dllhost.exe`` and
+    ``C:\\Windows\\System32\\dllhost.exe`` are refused.
+    """
+    if not process_name:
+        return False
+    name = str(process_name).strip().lower()
+    if name in _DENY_KILL_SET:
+        return True
+    basename = os.path.basename(name.replace("\\", "/"))
+    if basename in _DENY_KILL_SET:
+        return True
+    # Windows search infrastructure can appear with suffixes
+    # (e.g. "SearchFilterHost.exe", "SearchProtocolHost.exe").
+    return basename.startswith("search") and basename.endswith("host.exe")
 
 # ── Self-kill safety gate ────────────────────────────────────
 # Command-line fragments that identify THIS software (defender
@@ -232,6 +315,26 @@ CONTROL_TOKEN = (
     or os.getenv("CONTROL_TOKEN")
     or ""
 ).strip()
+
+# ── Detection Pipeline Supervision ───────────────────────────
+# The pipeline is the process that actually kills the attacker and
+# moves files to quarantine. Starting a web surface (SOC dashboard or
+# victim explorer) also starts it and keeps it alive, so the backend
+# can never be "quietly missing" during a demo.
+AUTOSTART_PIPELINE = _env_bool("ENTROPY_AUTOSTART_PIPELINE", True)
+# A heartbeat older than this counts as "pipeline is not running".
+PIPELINE_STALE_SECONDS = _env_float(
+    "ENTROPY_PIPELINE_STALE_SECONDS", 8.0, minimum=2.0
+)
+# How often the supervisor re-checks the pipeline.
+PIPELINE_SUPERVISOR_INTERVAL = _env_float(
+    "ENTROPY_PIPELINE_SUPERVISOR_INTERVAL", 3.0, minimum=0.5
+)
+# Minimum delay between pipeline start attempts (backs off when the
+# pipeline keeps crashing).
+PIPELINE_RESTART_COOLDOWN = _env_float(
+    "ENTROPY_PIPELINE_RESTART_COOLDOWN", 10.0, minimum=1.0
+)
 
 # ── Privileged Vault Access (Victim UI) ──────────────────────
 VAULT_USER = os.getenv("ENTROPY_VAULT_USER", "victim_user")

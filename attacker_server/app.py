@@ -373,20 +373,19 @@ def send_html(handler):
         else "http"
     )
 
-    victim_url = (
-        config.PUBLIC_VICTIM_URL
-        or f"{scheme}://{host}:8002"
-    )
+    def _sibling(explicit, port):
+        # 0.0.0.0 is a bind address, never a browsable host. Fall back to
+        # the configured port so the link can't point at a dead port
+        # (the victim explorer listens on ENTROPY_VICTIM_PORT, 5001).
+        if explicit and "//0.0.0.0" not in explicit and "//::" not in explicit:
+            return explicit
+        return f"{scheme}://{host}:{port}"
 
-    dashboard_url = (
-        config.PUBLIC_DASHBOARD_URL
-        or f"{scheme}://{host}:5000"
-    )
+    victim_url = _sibling(config.PUBLIC_VICTIM_URL, config.VICTIM_PORT)
 
-    attacker_url = (
-        config.PUBLIC_ATTACKER_URL
-        or f"{scheme}://{host}:8001"
-    )
+    dashboard_url = _sibling(config.PUBLIC_DASHBOARD_URL, config.DASHBOARD_PORT)
+
+    attacker_url = _sibling(config.PUBLIC_ATTACKER_URL, config.ATTACKER_PORT)
 
     html = html.replace(
         "__VICTIM_URL__",

@@ -32,8 +32,41 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 config._env_float("TEST_FLOAT", 1.0, minimum=0.0)
 
-    def test_default_watch_folder_is_confined_to_test_data(self):
-        self.assertEqual(config.WATCH_FOLDERS, [config.TESTING_DATA_DIR])
+    def test_default_watch_folders_include_the_victim_estate(self):
+        """The defended asset is always watched, whatever the .env says.
+
+        A .env copied from .env.example ships ``ENTROPY_WATCH_FOLDERS=``
+        (empty); the monitor then watched data/testing while an attack on
+        the victim estate ran to completion and the SOC dashboard stayed
+        at 0 events. The victim folder must be in the list even then.
+        """
+        victim = str(Path(config.VICTIM_USER_FILES).resolve())
+        self.assertIn(victim, config.WATCH_FOLDERS)
+        self.assertIn(str(Path(config.TESTING_DATA_DIR).resolve()),
+                      config.WATCH_FOLDERS)
+
+        for raw in ("", "   ", "data/testing"):
+            with self.subTest(raw=raw), \
+                    mock.patch.dict(os.environ,
+                                    {"ENTROPY_WATCH_FOLDERS": raw}):
+                folders = [str(Path(p).resolve())
+                           for p in config._watch_folders()]
+            self.assertIn(victim, folders)
+            self.assertEqual(len(folders), len(set(folders)))
+
+    def test_watch_victim_can_be_disabled_explicitly(self):
+        with mock.patch.dict(os.environ,
+                             {"ENTROPY_WATCH_FOLDERS": "data/testing",
+                              "ENTROPY_WATCH_VICTIM": "false"}):
+            folders = [str(Path(p).resolve()) for p in config._watch_folders()]
+        self.assertNotIn(str(Path(config.VICTIM_USER_FILES).resolve()),
+                         folders)
+
+    def test_pipeline_supervision_defaults_are_demo_ready(self):
+        self.assertTrue(config.AUTOSTART_PIPELINE)
+        self.assertGreater(config.PIPELINE_STALE_SECONDS, 2.0)
+        self.assertGreater(config.PIPELINE_SUPERVISOR_INTERVAL, 0.0)
+        self.assertGreater(config.PIPELINE_RESTART_COOLDOWN, 0.0)
 
 
 if __name__ == "__main__":

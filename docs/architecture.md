@@ -30,9 +30,12 @@ monitoring.event_pipeline.EventPipeline (queue 10000, batch 50)
       - DQN (opt-in, torch fallback)
     → response.response_module (terminate + quarantine)
       - ProcessTerminator: verified PID only, zombie-aware, self-kill whitelist
+      - Never-kill gate (config.DENY_KILL_PROCESSES): user/OS software refused
+        at attribution, in campaign kill memory and at the termination gate
       - FileQuarantine: install-time folder, SHA3-256 + SHA-256 dual hash, meta.json
     → Campaign sweep (quarantine+restore all campaign files)
-    → Post-kill verification (walk estate, hash vs last clean, repair mid-write)
+    → Post-kill verification (walk estate; repair only files that still show
+      ciphertext evidence - a clean file that merely changed is left alone)
     → response.backup_manager.BackupManager.restore (clean v1, rename-back)
     → response.forensic_report (one JSON per incident)
     → blockchain.connector.BlockchainConnector
@@ -50,6 +53,27 @@ monitoring.event_pipeline.EventPipeline (queue 10000, batch 50)
 3. `PipelineRunner`: snapshot 18 files into backup store (baseline for restore)
 4. `FileMonitor`: watch victim_server/user_files + protected stores (backup/quarantine deletion = tamper signal)
 5. Dashboard (5000), Victim (5001), Attacker (8001) Flask + socketio threading mode
+
+### Pipeline Supervision (`monitoring/pipeline_supervisor.py`)
+
+The defence is a separate process from the three UI surfaces, so it is easy to
+leave it out when starting only the web apps — the attack then completes and the
+SOC dashboard stays at 0 events. The supervisor removes that failure mode:
+
+- `pipeline_status()` reads the shared `pipeline_status` heartbeat row
+  (written every 2s by the pipeline) → cross-process liveness.
+- Starting the SOC dashboard or the victim explorer calls
+  `ensure_pipeline()`; a background thread re-checks every 3s and restarts the
+  pipeline if it dies, hangs (live process, no heartbeat for 30s), or is found
+  not watching `victim_server/user_files`.
+- Duplicate-start protection: fresh heartbeat, the process table (a pipeline
+  that is still importing), a 15s cross-process spawn guard, and the
+  `ENTROPY_PIPELINE_MANAGED=1` recursion flag.
+- `victim_server/user_files` is always in `config.WATCH_FOLDERS`
+  (`ENTROPY_WATCH_VICTIM=false` opts out).
+- Opt out of supervision entirely with `ENTROPY_AUTOSTART_PIPELINE=false`.
+- Endpoints: `GET /api/pipeline` (status), `POST /api/pipeline/restart`.
+- CLI: `python -m monitoring.pipeline_supervisor [status|start|restart|watch]`.
 
 ### Key Fixes for Industry Level (Final Year)
 
@@ -74,6 +98,13 @@ monitoring.event_pipeline.EventPipeline (queue 10000, batch 50)
 
 - Attacker confined to victim_server/user_files via safe_path() check
 - Defender never kills whitelisted or own tooling (DEFENDER_TOOLING_MARKERS)
+- Never-kill list (DENY_KILL_PROCESSES): browsers, Windows search/COM
+  surrogates, sync clients, Office and the EDR itself are never terminated,
+  whatever the attribution layer reports
+- Unverifiable attribution is never published as a named process: such events
+  record `unattributed` with no PID
+- SOC counters/monitor/decision panel report executed outcomes only (a refused
+  kill is `terminate_refused` + status `TERMINATE_REFUSED+QUARANTINED`)
 - Vault PIN compare_digest, session 8h, scope quarantine_only
 - Quarantine files cannot be decrypted (os.urandom, no key) - honest
 
@@ -86,4 +117,4 @@ These emit DeprecationWarning and delegate to canonical implementations.
 
 ### For 200 Marks
 
-This architecture is not PowerPoint - it's running code with 126 tests, deterministic benchmark, live demo verified, honest limitations published.
+This architecture is not PowerPoint - it's running code with 222 tests, deterministic benchmark, live demo verified, honest limitations published.

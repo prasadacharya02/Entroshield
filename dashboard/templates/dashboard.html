@@ -273,6 +273,7 @@ body {
 .dqn-decision.warn { color: var(--warning); }
 .dqn-conf { font-size: 13px; color: var(--text-dim); margin-bottom: 16px; }
 .dqn-conf .val { color: var(--accent); font-weight: 700; font-size: 16px; margin-left: 4px; }
+.dqn-escalation { font-size: 11px; letter-spacing: 1.4px; text-transform: uppercase; color: var(--warning); margin-bottom: 14px; }
 .dqn-reasoning { border-top: 1px dashed var(--border); padding-top: 14px; }
 .dqn-reasoning-title { font-size: 12px; letter-spacing: 2px; color: var(--text-mute); margin-bottom: 10px; text-transform: uppercase; }
 .dqn-factor { display: grid; grid-template-columns: 20px 1fr auto; gap: 10px; padding: 5px 0; font-size: 13px; color: var(--text-dim); align-items: center; }
@@ -289,6 +290,7 @@ body {
 .proc-hits { color: var(--warning); text-align: right; font-family: 'JetBrains Mono', monospace; }
 .proc-status { font-size: 10px; letter-spacing: 1px; padding: 3px 5px; border: 1px solid; text-align: center; text-transform: uppercase; font-weight: 700; }
 .proc-status.killed { color: var(--danger); border-color: var(--danger-dim); }
+.proc-status.contained { color: var(--warning); border-color: rgba(245,158,11,0.45); }
 .proc-status.watch { color: var(--warning); border-color: rgba(245,158,11,0.3); }
 
 /* BLOCKCHAIN */
@@ -434,7 +436,7 @@ body {
     <div class="metric">
       <div class="metric-lbl">THREATS · DET</div>
       <div class="metric-val danger" id="m-threats">0000</div>
-      <div class="metric-sub">blocked / logged</div>
+      <div class="metric-sub" id="m-threats-sub">blocked / logged</div>
     </div>
     <div class="metric">
       <div class="metric-lbl">RECOVERY · RST</div>
@@ -461,6 +463,7 @@ body {
       <div class="dqn-body">
         <div class="dqn-decision safe" id="dqn-decision">STANDBY</div>
         <div class="dqn-conf">CONFIDENCE:<span class="val" id="dqn-conf">--</span></div>
+        <div class="dqn-escalation" id="dqn-escalation" style="display:none"></div>
         <div class="dqn-reasoning">
           <div class="dqn-reasoning-title">DECISION FACTORS</div>
           <div id="dqn-factors">
@@ -654,6 +657,13 @@ async function loadStats() {
     document.getElementById('m-chain').textContent = pad(bcTx);
     document.getElementById('m-vault').textContent = pad(quar);
     document.getElementById('m-threats').textContent = pad(threats);
+    const refused = d.terminate_refused || 0;
+    const threatsSub = document.getElementById('m-threats-sub');
+    if (threatsSub) {
+      threatsSub.textContent = refused > 0
+        ? refused + ' refused by safety gate'
+        : 'blocked / logged';
+    }
     document.getElementById('m-recovery').textContent = pad(recovery);
     document.getElementById('chain-val').textContent = bcTx + ' TX';
 
@@ -725,6 +735,24 @@ async function loadDQN() {
     dec.className = 'dqn-decision ' + (d.decision.includes('IGNORE') ? 'safe' : d.decision.includes('ALERT') ? 'warn' : '');
     conf.textContent = d.confidence + '%';
 
+    // Say WHY the action went past the per-file verdict (campaign
+    // confirmation, ransom note, tamper, repair pass, ...). Without
+    // this the panel showed "TERMINATE + QUARANTINE" beside an engine
+    // line reading "Decision: ALERT | Threat score: 0/100".
+    const esc = document.getElementById('dqn-escalation');
+    if (esc) {
+      if (d.escalated && d.escalation) {
+        esc.textContent = 'ESCALATED · ' + d.escalation;
+        esc.style.display = '';
+      } else if (d.decision && d.decision !== 'STANDBY') {
+        esc.textContent = 'ENGINE VERDICT · no escalation';
+        esc.style.display = '';
+      } else {
+        esc.textContent = '';
+        esc.style.display = 'none';
+      }
+    }
+
     fac.innerHTML = d.factors.map(f => `
       <div class="dqn-factor">
         <span class="${f.pass ? 'check' : 'cross'}">${f.pass ? '✓' : '·'}</span>
@@ -746,7 +774,11 @@ async function loadProcesses() {
         <div class="proc-pid">${p.pid || '--'}</div>
         <div class="proc-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name || 'unknown')}</div>
         <div class="proc-hits">${p.hits}x</div>
-        <div class="proc-status ${p.status}">${p.status.toUpperCase()}</div>
+        <div class="proc-status ${p.status}" title="${p.status === 'killed'
+            ? 'Process terminated by the response layer'
+            : (p.kill_refused
+                ? 'Termination refused by the safety layer (never-kill / identity gate) — file contained instead'
+                : 'Flagged, no kill recorded')}">${p.status.toUpperCase()}</div>
       </div>`).join('');
   } catch(e) {}
 }

@@ -248,12 +248,68 @@ def make_pdf_content():
         + b"\n%%EOF\n"
     )
     return output
-def make_binary_content(size_kb):
-    """Create fake image/zip content — realistic file structure"""
-    # Simple structured pattern (like real files have headers)
-    header = b'\x89PNG\r\n\x1a\n' + b'\x00' * 8
-    body = bytes([i % 128 for i in range(size_kb * 1024)])
-    return header + body
+def _lcg_bytes(size, seed=7, alphabet=192):
+    """Deterministic pseudo-random bytes over a restricted alphabet.
+
+    A restricted alphabet keeps the entropy inside the format's normal
+    range instead of looking like a full-entropy ciphertext block.
+    """
+    rng = random.Random(seed)
+    out = bytearray()
+    while len(out) < size:
+        out.append(rng.randrange(0, alphabet))
+    return bytes(out[:size])
+
+
+def make_jpeg_content(size_kb, seed=7):
+    """Structurally valid JPEG (SOI/APP0/DQT/SOF0/DHT/SOS...EOI).
+
+    The fixtures must carry the magic bytes of their own extension: the
+    detector treats a file whose header does not match its extension as
+    destroyed (ransomware wrote over it), so a PNG header inside a .jpg
+    made every benign rewrite look like an attack.
+    """
+    header = (
+        b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+        b"\xff\xdb\x00C\x00" + bytes(range(1, 65))
+        + b"\xff\xc0\x00\x11\x08\x00\x20\x00\x20\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01"
+        b"\xff\xc4\x00\x1f\x00" + bytes((i % 12) + 1 for i in range(28))
+        + b"\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00"
+    )
+    body_size = max(0, size_kb * 1024 - len(header) - 2)
+    body = bytearray()
+    rng = random.Random(seed)
+    while len(body) < body_size:
+        value = rng.randrange(0, 192)
+        if value == 0xFF:
+            # entropy-coded JPEG data never carries a bare 0xFF
+            body += b"\xff\x00"
+        else:
+            body.append(value)
+    return bytes(header) + bytes(body[:body_size]) + b"\xff\xd9"
+
+
+def make_zip_content(size_kb, seed=7):
+    """Real (stored) ZIP archive so the PK magic matches the extension."""
+    payload_size = max(1024, size_kb * 1024 - 1024)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("update/manifest.txt",
+                         "ENTROPY demo software update\n" * 8)
+        archive.writestr("update/payload.bin",
+                         _lcg_bytes(payload_size, seed=seed, alphabet=192))
+    return buffer.getvalue()
+
+
+def make_binary_content(size_kb, ext=".jpg", seed=7):
+    """Create fake image/zip content with the magic header of *ext*."""
+    if ext.lower() in (".jpg", ".jpeg"):
+        return make_jpeg_content(size_kb, seed=seed)
+    if ext.lower() == ".zip":
+        return make_zip_content(size_kb, seed=seed)
+    # Generic binary fallback: correct PNG structure for unknown types
+    header = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+    return header + _lcg_bytes(size_kb * 1024, seed=seed, alphabet=128)
 # ═══════════════════════════════════════════════════
 # FILE CREATION
 # ═══════════════════════════════════════════════════
@@ -269,14 +325,14 @@ FILES = {
     "Downloads": [
         ("Invoice_INV-2024-1042.pdf",   "binary", make_pdf_content),
         ("Invoice_INV-2024-1043.pdf",   "binary", make_pdf_content),
-        ("Software_Update.zip",         "binary", lambda: make_binary_content(150)),
-        ("Report_Draft.docx",           "text", make_client_notes),
+        ("Software_Update.zip",         "binary", lambda: make_binary_content(150, ".zip")),
+        ("Report_Draft.docx",           "binary", make_docx_content),
     ],
     "Pictures": [
-        ("Family_Vacation_2023.jpg",    "binary", lambda: make_binary_content(200)),
-        ("Wedding_Photos.jpg",          "binary", lambda: make_binary_content(300)),
-        ("Birthday_Party.jpg",          "binary", lambda: make_binary_content(180)),
-        ("Beach_Trip.jpg",              "binary", lambda: make_binary_content(220)),
+        ("Family_Vacation_2023.jpg",    "binary", lambda: make_binary_content(200, ".jpg")),
+        ("Wedding_Photos.jpg",          "binary", lambda: make_binary_content(300, ".jpg")),
+        ("Birthday_Party.jpg",          "binary", lambda: make_binary_content(180, ".jpg")),
+        ("Beach_Trip.jpg",              "binary", lambda: make_binary_content(220, ".jpg")),
     ],
     "Desktop": [
         ("Passwords.txt",               "text", make_passwords),

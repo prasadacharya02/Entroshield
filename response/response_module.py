@@ -183,6 +183,17 @@ class ProcessTerminator:
                        f"whitelisted process: {process_name}")
             return result
 
+        # Safety check 3b: ordinary user/OS software (browsers, the
+        # Windows search indexer, COM surrogate, sync clients, Office,
+        # the AV engine) routinely holds legitimate handles on files in
+        # a user folder. It is never terminated automatically.
+        if config.is_denied_process(process_name):
+            result['message'] = (f'Refused: {process_name} is user/OS '
+                                 f'software (never-kill list)')
+            log.warning("[SAFETY] Refused to kill user/OS process: %s",
+                        process_name)
+            return result
+
         if config.DRY_RUN:
             result['success'] = True
             result['message'] = 'Dry-run: termination simulated, process left running'
@@ -216,6 +227,13 @@ class ProcessTerminator:
                                     f'{actual_name} is whitelisted')
                 log.warning(f"[SAFETY] Refused to kill "
                            f"whitelisted: {actual_name}")
+                return result
+
+            if config.is_denied_process(actual_name):
+                result['message'] = (f'Refused: actual process '
+                                    f'{actual_name} is user/OS software')
+                log.warning("[SAFETY] Refused to kill user/OS process: %s",
+                            actual_name)
                 return result
 
             if expected_create_time is not None:

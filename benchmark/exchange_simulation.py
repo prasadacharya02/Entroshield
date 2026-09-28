@@ -98,7 +98,8 @@ def _make_events_db() -> sqlite3.Connection:
             entropy_delta REAL, pid INTEGER, process_name TEXT,
             action INTEGER, status TEXT, requested_action INTEGER,
             outcome TEXT, restore_result TEXT, dry_run INTEGER,
-            engine TEXT, confidence REAL, explanation TEXT, q_values TEXT
+            engine TEXT, confidence REAL, explanation TEXT, q_values TEXT,
+            threat_score REAL
         )
     """)
     conn.commit()
