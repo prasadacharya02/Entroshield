@@ -379,6 +379,9 @@ def send_html(handler):
         # (the victim explorer listens on ENTROPY_VICTIM_PORT, 5001).
         if explicit and "//0.0.0.0" not in explicit and "//::" not in explicit:
             return explicit
+        if re.match(r"^\d+-", host):
+            target_host = re.sub(r"^\d+-", f"{port}-", host)
+            return f"{scheme}://{target_host}"
         return f"{scheme}://{host}:{port}"
 
     victim_url = _sibling(config.PUBLIC_VICTIM_URL, config.VICTIM_PORT)

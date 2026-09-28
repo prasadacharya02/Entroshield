@@ -71,7 +71,9 @@ ACTION_MAP = {
 @app.route("/")
 def index():
     """Main route mapped back to the SOC Dashboard."""
-    return render_template("dashboard.html")
+    victim_url = _public_base_url(config.VICTIM_PORT, config.PUBLIC_VICTIM_URL)
+    attacker_url = _public_base_url(config.ATTACKER_PORT, config.PUBLIC_ATTACKER_URL)
+    return render_template("dashboard.html", victim_url=victim_url, attacker_url=attacker_url)
 
 
 def _is_bind_address(url: str | None) -> bool:
@@ -90,7 +92,11 @@ def _public_base_url(port: int, explicit: str | None = None) -> str:
     """
     if explicit and not _is_bind_address(explicit):
         return explicit
+    import re
     host = request.host.split(":", 1)[0] or "127.0.0.1"
+    if re.match(r"^\d+-", host):
+        target_host = re.sub(r"^\d+-", f"{port}-", host)
+        return f"{request.scheme}://{target_host}"
     return f"{request.scheme}://{host}:{port}"
 
 

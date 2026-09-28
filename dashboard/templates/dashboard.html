@@ -389,6 +389,8 @@ body {
       <span class="tb-current">overview</span>
     </div>
     <div class="topbar-right">
+      <a id="link-victim" href="{{ victim_url|default('#') }}" target="_blank" style="color:var(--cyan);text-decoration:none;font-size:12px;margin-right:8px;border:1px solid #22293a;padding:4px 8px;border-radius:4px;">💻 Victim PC (:5001)</a>
+      <a id="link-attacker" href="{{ attacker_url|default('#') }}" target="_blank" style="color:#ffb000;text-decoration:none;font-size:12px;margin-right:12px;border:1px solid #22293a;padding:4px 8px;border-radius:4px;">🎯 Attacker Console (:8001)</a>
       <span class="tb-info"><span class="lbl">MODE:</span><span class="val accent" id="mode-val">MONITORING</span></span>
       <span class="tb-info"><span class="lbl">CHAIN:</span><span class="val" id="chain-val">-- TX</span></span>
       <span class="tb-info"><span class="lbl">TIME:</span><span class="val" id="tb-time">--:--:--</span></span>
@@ -908,6 +910,19 @@ async function loadAll() {
   ]);
 }
 
+function setupHeaderLinks() {
+  const h = location.hostname, p = location.protocol;
+  const isSandbox = /^\d+-/.test(h);
+  const lv = document.getElementById('link-victim');
+  const la = document.getElementById('link-attacker');
+  if (lv && (!lv.getAttribute('href') || lv.getAttribute('href') === '#' || isSandbox)) {
+    lv.href = isSandbox ? `${p}//${h.replace(/^\d+-/, "5001-")}` : `${p}//${h}:5001`;
+  }
+  if (la && (!la.getAttribute('href') || la.getAttribute('href') === '#' || isSandbox)) {
+    la.href = isSandbox ? `${p}//${h.replace(/^\d+-/, "8001-")}` : `${p}//${h}:8001`;
+  }
+}
+setupHeaderLinks();
 initChart();
 loadAll();
 setInterval(loadStats, 1000);

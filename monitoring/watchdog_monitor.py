@@ -284,48 +284,51 @@ class EntropyEventHandler(FileSystemEventHandler):
             self._handle("RENAMED", event.src_path, dest_path=event.dest_path)
     
     def _handle(self, event_type, file_path, dest_path=None):
-        target_path = dest_path if dest_path else file_path
-        if self._should_ignore(event_type, target_path):
-            return
-        
-        self.speed_tracker.record_event()
-        rate = self.speed_tracker.get_rate()
-        win_count = self.speed_tracker.get_count_in_window()
-        proc = self.process_finder.get_process_info(target_path)
-        
-        _, ext = os.path.splitext(target_path)
-        
-        file_size = None
-        if os.path.exists(target_path):
-            try: file_size = os.path.getsize(target_path)
-            except Exception: pass
-        
-        event_dict = {
-            'event_id'       : hashlib.md5(str(time.time()).encode()).hexdigest()[:12],
-            'timestamp'      : datetime.now().isoformat(),
-            'unix_timestamp' : time.time(),
-            'event_type'     : event_type,
-            'file_path'      : target_path,
-            'original_path'  : file_path,
-            'dest_path'      : dest_path,
-            'file_extension' : ext.lower(),
-            'file_size'      : file_size,
-            'events_per_sec' : round(rate, 2),
-            'events_in_window': win_count,
-            'process'        : proc,
-            'is_suspicious_speed': rate > getattr(config, "FILES_PER_SECOND_THRESHOLD", 1.0),
-            'ext_changed'    : self._check_ext_changed(file_path, dest_path),
-            'entropy_score'  : None,
-            'ai_decision'    : None,
-            'action_taken'   : None,
-        }
-        
-        self.event_store.add_event(event_dict)
-        
-        symbols = {'CREATED': '[+]', 'MODIFIED': '[~]', 'DELETED': '[-]', 'RENAMED': '[>]'}
-        sym = symbols.get(event_type, '[?]')
-        fname = os.path.basename(target_path)
-        log.info(f"{sym} {event_type:8} | {fname:35} | {rate:.1f} ev/sec")
+        try:
+            target_path = dest_path if dest_path else file_path
+            if self._should_ignore(event_type, target_path):
+                return
+            
+            self.speed_tracker.record_event()
+            rate = self.speed_tracker.get_rate()
+            win_count = self.speed_tracker.get_count_in_window()
+            proc = self.process_finder.get_process_info(target_path)
+            
+            _, ext = os.path.splitext(target_path)
+            
+            file_size = None
+            if os.path.exists(target_path):
+                try: file_size = os.path.getsize(target_path)
+                except Exception: pass
+            
+            event_dict = {
+                'event_id'       : hashlib.md5(str(time.time()).encode()).hexdigest()[:12],
+                'timestamp'      : datetime.now().isoformat(),
+                'unix_timestamp' : time.time(),
+                'event_type'     : event_type,
+                'file_path'      : target_path,
+                'original_path'  : file_path,
+                'dest_path'      : dest_path,
+                'file_extension' : ext.lower(),
+                'file_size'      : file_size,
+                'events_per_sec' : round(rate, 2),
+                'events_in_window': win_count,
+                'process'        : proc,
+                'is_suspicious_speed': rate > getattr(config, "FILES_PER_SECOND_THRESHOLD", 1.0),
+                'ext_changed'    : self._check_ext_changed(file_path, dest_path),
+                'entropy_score'  : None,
+                'ai_decision'    : None,
+                'action_taken'   : None,
+            }
+            
+            self.event_store.add_event(event_dict)
+            
+            symbols = {'CREATED': '[+]', 'MODIFIED': '[~]', 'DELETED': '[-]', 'RENAMED': '[>]'}
+            sym = symbols.get(event_type, '[?]')
+            fname = os.path.basename(target_path)
+            log.info(f"{sym} {event_type:8} | {fname:35} | {rate:.1f} ev/sec")
+        except Exception as exc:
+            log.error(f"[MONITOR] Error handling {event_type} on {file_path}: {exc}")
     
     # Defender-only temporary suffixes. These are OUR files. An
     # attacker who writes to these exact suffixes is deliberately
@@ -335,6 +338,7 @@ class EntropyEventHandler(FileSystemEventHandler):
                               '.swp', '.swx', '.bak', '~')
 
     def _should_ignore(self, event_type, file_path):
+        target = os.path.abspath(file_path).lower()
         p = file_path.lower()
         fn = os.path.basename(file_path)
 
@@ -350,7 +354,7 @@ class EntropyEventHandler(FileSystemEventHandler):
             file_path, self.protected_stores
         )
         in_victim = any(
-            os.path.commonpath([p, wp.lower()]) == wp.lower()
+            target == wp or target.startswith(wp + os.sep)
             for wp in (self.watch_folders or [])
         )
         if not in_victim:

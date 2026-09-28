@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import json
+import sqlite3
 import hashlib
 import logging
 from collections import deque
@@ -167,11 +168,19 @@ def save_to_db(conn, event, action, status, outcome=None, decision=None,
             columns = {k: v for k, v in columns.items() if k in present}
         names = ", ".join(columns)
         marks = ",".join("?" for _ in columns)
-        conn.execute(
-            f"INSERT INTO events ({names}) VALUES ({marks})",
-            tuple(columns.values()),
-        )
-        conn.commit()
+        for attempt in range(3):
+            try:
+                conn.execute(
+                    f"INSERT INTO events ({names}) VALUES ({marks})",
+                    tuple(columns.values()),
+                )
+                conn.commit()
+                break
+            except sqlite3.OperationalError as op_err:
+                if ("locked" in str(op_err).lower() or "busy" in str(op_err).lower()) and attempt < 2:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise
     except Exception as e:
         log.error(f"[DB] Save failed: {e}")
 
