@@ -283,7 +283,7 @@ EXCHANGE_CONFIRM_THRESHOLD = _env_int("ENTROPY_EXCHANGE_CONFIRM_THRESHOLD", 2, m
 EXCHANGE_ENABLED = _env_bool("ENTROPY_EXCHANGE", True)
 
 # ── Web Servers & Hosts ──────────────────────────────────────
-DASHBOARD_HOST = os.getenv("ENTROPY_DASHBOARD_HOST", "127.0.0.1")
+DASHBOARD_HOST = os.getenv("ENTROPY_DASHBOARD_HOST", "0.0.0.0")
 DASHBOARD_PORT = _env_int("ENTROPY_DASHBOARD_PORT", 5000, minimum=1)
 FLASK_HOST = DASHBOARD_HOST
 FLASK_PORT = DASHBOARD_PORT
@@ -292,7 +292,7 @@ PUBLIC_DASHBOARD_URL = (
     or f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}"
 )
 
-VICTIM_HOST = os.getenv("ENTROPY_VICTIM_HOST", "127.0.0.1")
+VICTIM_HOST = os.getenv("ENTROPY_VICTIM_HOST", "0.0.0.0")
 VICTIM_PORT = _env_int("ENTROPY_VICTIM_PORT", 5001, minimum=1)
 PUBLIC_VICTIM_URL = (
     os.getenv("ENTROPY_PUBLIC_VICTIM_URL", "").strip()
@@ -313,7 +313,7 @@ DRY_RUN = _env_bool("ENTROPY_DRY_RUN", False)
 CONTROL_TOKEN = (
     os.getenv("ENTROPY_CONTROL_TOKEN")
     or os.getenv("CONTROL_TOKEN")
-    or ""
+    or "entropy-lab"
 ).strip()
 
 # ── Detection Pipeline Supervision ───────────────────────────

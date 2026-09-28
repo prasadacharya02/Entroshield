@@ -303,8 +303,8 @@ $('btn-reset').onclick = async () => { await j('/api/lab/reset', {method:'POST'}
 // Sibling-service links are rendered by the dashboard server, which
 // derives them from this request (scheme + host). Hardcoded ports here
 // pointed the victim link at a dead port (8002).
-$("link-victim").href = {{ victim_url | tojson }};
-$("link-attacker").href = {{ attacker_url | tojson }};
+const _lv = $("link-victim"); if (_lv) _lv.href = {{ victim_url | tojson }};
+const _la = $("link-attacker"); if (_la) _la.href = {{ attacker_url | tojson }};
 loadFamilies();
 refresh();
 setInterval(refresh, 2000);

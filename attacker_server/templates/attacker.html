@@ -198,7 +198,12 @@
       $("statistics").innerHTML = `hit=<span>${stats.files_hit||0}</span> skipped=<span>${stats.files_skipped||0}</span> notes=<span>${stats.notes_dropped||0}</span> bytes=<span>${formatBytes(stats.bytes_encrypted)}</span> family=<span>${escapeHtml(stats.family||"-")}</span>`;
       const entries = stats.log||[];
       $("log-count").textContent = entries.length+" lines";
-      $("log").innerHTML = entries.length ? entries.map(e=>`<span style="color:#385">${escapeHtml(e.time)}</span>  ${escapeHtml(e.msg)}`).join("\n") : "waiting for operator_";
+      $("log").innerHTML = entries.length ? entries.map(e => {
+        if (typeof e === 'object' && e !== null) {
+          return `<span style="color:#385">${escapeHtml(e.time || '')}</span>  ${escapeHtml(e.msg || '')}`;
+        }
+        return escapeHtml(e);
+      }).join("\n") : "waiting for operator_";
       if(state.followLog) $("log").scrollTop = $("log").scrollHeight;
     } catch(e) { setError("node offline"); }
   }
@@ -210,8 +215,11 @@
   function setupLinks(){
     const h=location.hostname, p=location.protocol;
     const injected = (v, fallback) => (v && v.indexOf("__") !== 0) ? v : fallback;
-    $("victim-link").href = injected(VICTIM_URL, `${p}//${h}:5001`);
-    $("soc-link").href = injected(SOC_URL, `${p}//${h}:5000`);
+    const isSandboxProxy = /^\d+-/.test(h);
+    const vicFallback = isSandboxProxy ? `${p}//${h.replace(/^\d+-/, "5001-")}` : `${p}//${h}:5001`;
+    const socFallback = isSandboxProxy ? `${p}//${h.replace(/^\d+-/, "5000-")}` : `${p}//${h}:5000`;
+    $("victim-link").href = injected(VICTIM_URL, vicFallback);
+    $("soc-link").href = injected(SOC_URL, socFallback);
   }
   $("log").addEventListener("scroll",()=>{ const el=$("log"); state.followLog = el.scrollHeight-el.scrollTop-el.clientHeight<16; });
   setupLinks(); loadFamilies(); poll(); setInterval(poll,700);

@@ -133,6 +133,8 @@
         <button class="tool" onclick="refreshAll()">Refresh</button>
         <button class="tool" onclick="showHome()">This PC</button>
         <button class="tool lock-btn" id="vaultBtn" onclick="handleVaultBtn()">🔐 Vault Login</button>
+        <a id="linkSOC" href="{{ dashboard_url|default('#') }}" target="_blank" class="tool" style="color:#0078d4;text-decoration:none;margin-left:auto;font-weight:600;">📊 SOC Dashboard (:5000)</a>
+        <a id="linkAttacker" href="{{ attacker_url|default('#') }}" target="_blank" class="tool" style="color:#c45c00;text-decoration:none;font-weight:600;">🎯 Attacker Console (:8001)</a>
       </div>
       <div class="pathbar">
         <button class="navbtn" onclick="showHome()" title="Up">↑</button>
@@ -545,8 +547,21 @@
     document.getElementById("liveClock").textContent = d.toLocaleTimeString();
   }
 
+  function setupSiblingLinks() {
+    const isSandbox = /^\d+-/.test(location.hostname);
+    const socEl = document.getElementById("linkSOC");
+    const attEl = document.getElementById("linkAttacker");
+    if (socEl && (!socEl.getAttribute("href") || socEl.getAttribute("href") === "#" || isSandbox)) {
+      socEl.href = isSandbox ? `${location.protocol}//${location.hostname.replace(/^\d+-/, "5000-")}` : `${location.protocol}//${location.hostname}:5000`;
+    }
+    if (attEl && (!attEl.getAttribute("href") || attEl.getAttribute("href") === "#" || isSandbox)) {
+      attEl.href = isSandbox ? `${location.protocol}//${location.hostname.replace(/^\d+-/, "8001-")}` : `${location.protocol}//${location.hostname}:8001`;
+    }
+  }
+
   // Boot
   (async () => {
+    setupSiblingLinks();
     await checkVault();
     await showHome();
   })();

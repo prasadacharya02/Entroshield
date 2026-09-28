@@ -86,6 +86,7 @@ def _env(dry_run: bool | None = None) -> dict[str, str]:
     _set_default(env, "ENTROPY_DRY_RUN", "false")
     _set_default(env, "ENTROPY_CONTROL_TOKEN", "entropy-lab")
     _set_default(env, "ENTROPY_BLOCKCHAIN_FALLBACK", "true")
+    _set_default(env, "ENTROPY_PIPELINE_MANAGED", "1")
     _set_default(env, "PYTHONUNBUFFERED", "1")
 
     # The lab exists to defend the victim estate: it must ALWAYS be
@@ -121,6 +122,10 @@ def _ensure_quarantine():
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    except (ValueError, AttributeError):
+        pass
     argv = sys.argv[1:] if argv is None else argv
     _ensure_quarantine()
 

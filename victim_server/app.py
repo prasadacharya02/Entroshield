@@ -128,11 +128,24 @@ def _ransom_note_family(filename: str):
     return family
 
 
+def _public_base_url(port: int, explicit: str | None = None) -> str:
+    if explicit and not ("//0.0.0.0" in explicit or "//::" in explicit):
+        return explicit
+    import re
+    host = request.host.split(":", 1)[0] or "127.0.0.1"
+    if re.match(r"^\d+-", host):
+        target_host = re.sub(r"^\d+-", f"{port}-", host)
+        return f"{request.scheme}://{target_host}"
+    return f"{request.scheme}://{host}:{port}"
+
+
 # ── Routes ───────────────────────────────────────────────────
 
 @app.route("/")
 def index():
-    return render_template("victim.html")
+    dashboard_url = _public_base_url(config.DASHBOARD_PORT, getattr(config, "PUBLIC_DASHBOARD_URL", None))
+    attacker_url = _public_base_url(config.ATTACKER_PORT, getattr(config, "PUBLIC_ATTACKER_URL", None))
+    return render_template("victim.html", dashboard_url=dashboard_url, attacker_url=attacker_url)
 
 
 @app.route("/api/health")
