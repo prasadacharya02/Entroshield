@@ -160,6 +160,9 @@ class Tenant:
             "entropy_overall": result.get("entropy_overall", 0.0),
             "entropy_delta": result.get("entropy_delta", 0.0),
             "threat_score": result.get("threat_score", 0.0),
+            "chi2_uniformity": result.get("chi2_uniformity"),
+            "chi2_tail": result.get("chi2_tail"),
+            "magic_ok": result.get("magic_ok", True),
             "events_per_sec": 0.0,
             "is_suspicious_speed": False,
             "ext_changed": False,
@@ -308,11 +311,30 @@ def run_simulation(base_dir: str | None = None) -> dict:
         (charlie.root / "Documents").mkdir(parents=True, exist_ok=True)
         (charlie.root / "Documents/planning.txt").write_bytes(CLEAN_TEXT)
         workload_ops = [charlie.process("Documents/planning.txt", "CREATED")]
+        import zipfile, io
         for i in range(3):
             name = f"Archives/backup_{i:02d}.zip"
-            (charlie.root / name).write_bytes(
-                random.Random(100 + i).randbytes(32768)
-            )
+            # Build a REAL zip file so its magic header (PK\x03\x04)
+            # and byte distribution match a legitimate archive — not
+            # uniform random bytes that would fail magic-byte / chi²
+            # checks (which are the ciphertext fingerprints).
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                rng = random.Random(100 + i)
+                # Use compressible textual content so the resulting
+                # archive has the byte-frequency peaks (chi² > 300)
+                # that distinguish real compressed files from
+                # statistically-uniform ciphertext.
+                zf.writestr(
+                    f"manifest_{i}.txt",
+                    ("backup index " + str(i) + "\n") * 800
+                    + "".join(chr(rng.randint(32, 126)) for _ in range(8000)),
+                )
+                zf.writestr(
+                    f"notes_{i}.txt",
+                    ("quarterly results " + str(i) + "\n") * 600,
+                )
+            (charlie.root / name).write_bytes(buf.getvalue())
             workload_ops.append(charlie.process(name, "CREATED"))
         phases.append({
             "phase": "6_workload_honesty",

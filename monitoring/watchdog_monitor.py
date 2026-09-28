@@ -219,13 +219,16 @@ class SpeedTracker:
 
 class EntropyEventHandler(FileSystemEventHandler):
     def __init__(self, event_store, speed_tracker, process_finder,
-                 protected_stores=None):
+                 protected_stores=None, watch_folders=None):
         super().__init__()
         self.event_store    = event_store
         self.speed_tracker  = speed_tracker
         self.process_finder = process_finder
         self.protected_stores = protected_stores or (
             config.QUARANTINE_DIR, config.BACKUP_DIR
+        )
+        self.watch_folders = tuple(
+            os.path.abspath(w).lower() for w in (watch_folders or config.WATCH_FOLDERS)
         )
     
     def on_created(self, event):
@@ -288,15 +291,38 @@ class EntropyEventHandler(FileSystemEventHandler):
         fname = os.path.basename(target_path)
         log.info(f"{sym} {event_type:8} | {fname:35} | {rate:.1f} ev/sec")
     
+    # Defender-only temporary suffixes. These are OUR files. An
+    # attacker who writes to these exact suffixes is deliberately
+    # hiding in defence noise and must NOT be ignored — the filter
+    # only applies inside protected stores below.
+    _DEFENDER_TMP_SUFFIXES = ('.tmp', '.temp', '.log', '.part', '.crdownload',
+                              '.swp', '.swx', '.bak', '~')
+
     def _should_ignore(self, event_type, file_path):
         p = file_path.lower()
-        if p.endswith('.tmp') or p.endswith('.temp') or p.endswith('.log'):
-            return True
         fn = os.path.basename(file_path)
-        if fn.startswith('~') or fn.startswith('.'):
-            # Hidden/temp names (incl. the defender's own
-            # .restore_tmp.* files) are not user documents.
+
+        # Always ignore log files regardless of folder.
+        if p.endswith('.log'):
             return True
+
+        # Hidden / temp names are only ignored OUTSIDE the victim
+        # folder. Inside the watched victim tree, ransomware CAN hide
+        # files by prefixing with '.' or '~' (Conti/LockBit both do
+        # this for staging files) so we must analyze them.
+        in_protected = FileMonitor._is_protected_store_path(
+            file_path, self.protected_stores
+        )
+        in_victim = any(
+            os.path.commonpath([p, wp.lower()]) == wp.lower()
+            for wp in (self.watch_folders or [])
+        )
+        if not in_victim:
+            if fn.startswith('~') or fn.startswith('.'):
+                return True
+            if any(p.endswith(s) for s in self._DEFENDER_TMP_SUFFIXES):
+                return True
+
         if config.LOG_DIR.lower() in p:
             return True
         # Our own defense stores: only deletions are meaningful

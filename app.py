@@ -401,18 +401,34 @@ def push_updates():
                         the SOC timeline, entropy graph, and alert
                         panel update live without polling.
     * ``live_update`` — counter heartbeat (totals / threats).
+
+    If the database is rotated/reset underneath us (e.g. the attacker
+    reset endpoint or an operator wipe), the thread re-initialises the
+    schema and resyncs its cursor rather than 500-looping.
     """
     last_id = _last_event_id()
     while True:
         try:
             with app.app_context():
-                # ── 1) Push any events the pipeline persisted since
-                #       the last pass (this is the real-time channel).
                 db = get_db()
-                new_rows = db.execute(
-                    "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT 100",
-                    (last_id,),
-                ).fetchall()
+                # Defensive: if the events table disappeared under us,
+                # re-initialise the schema and resync before querying.
+                try:
+                    new_rows = db.execute(
+                        "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT 100",
+                        (last_id,),
+                    ).fetchall()
+                except Exception:
+                    try:
+                        init_db()
+                    except Exception:
+                        pass
+                    last_id = _last_event_id()
+                    db = get_db()
+                    new_rows = db.execute(
+                        "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT 100",
+                        (last_id,),
+                    ).fetchall()
                 if new_rows:
                     for row in new_rows:
                         try:

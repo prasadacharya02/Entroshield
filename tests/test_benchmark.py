@@ -54,27 +54,24 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertEqual(without["max_action"], 3)
         self.assertEqual(with_baseline["max_action"], 3)
 
-    def test_single_file_disguise_rename_stays_alert(self):
-        """Per-file conservatism is preserved: a SINGLE file renamed to
-        a disguise extension with high entropy is suspicious (ALERT)
-        but is not, on its own, a confirmed campaign (no quarantine)."""
+    def test_single_file_ciphertext_quarantines(self):
+        """A single file whose content is statistically-uniform ciphertext
+        (chi² ≈ 255 + invalid magic header for its extension) trips the
+        structural ciphertext fingerprint and is quarantined on first
+        sight — you don't need a second file to confirm AES-output."""
         from benchmark.scenarios import Op, Scenario, random_bytes
         import random
         rng = random.Random(7)
-        # A high-entropy baseline file (delta ~0 after "encryption")
-        # renamed to a disguise extension: the per-file score is
-        # ALERT-level (range + extension, 60), below the quarantine
-        # bar — with only ONE file, the campaign must not fire.
         scenario = Scenario(
             "single_disguise", "attack",
-            "One high-entropy file renamed to a disguise extension",
+            "One high-entropy ciphertext file renamed to a disguise extension",
             [("Data/blob.dat", random_bytes(rng, 65536))],
             [Op("rename", "Data/blob.dat", random_bytes(rng, 65536),
                 new_path="Data/blob.dat.wnaCry", delay_before=1.0)],
         )
         run = runner.simulate_scenario(scenario, baseline=True, root=_root())
         self.assertTrue(run["detected"])
-        self.assertEqual(run["max_action"], 1)  # ALERT, not QUARANTINE
+        self.assertEqual(run["max_action"], 3)  # QUARANTINE — strong ciphertext fingerprint
 
     def test_campaign_never_fires_on_high_entropy_media(self):
         """Legitimate high-entropy multi-file work (photo import: no
@@ -117,17 +114,25 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertEqual(run["first_detection_op"], 0)
         self.assertEqual(run["max_action"], 3)
 
-    def test_image_blindspot_is_reported_honestly(self):
-        """In-place encryption of in-range media is a documented blind
-        spot of entropy-only detection: pin it so a future fix changes
-        the report on purpose, not by accident."""
+    def test_image_blindspot_is_detected_via_structural_ciphertext(self):
+        """In-place encryption of .jpg files is now caught by the
+        structural ciphertext fingerprint (chi² uniformity test on
+        tail + magic-byte validation). This used to be an entropy-only
+        blind spot; closing it is what pushes detection to ≥99.99 %."""
         for baseline in (False, True):
             run = runner.simulate_scenario(
                 attack_image_blindspot(1), baseline=baseline, root=_root(),
             )
-            self.assertFalse(run["detected"], f"baseline={baseline}")
-            summary = runner.summarize([run])
-            self.assertIn("image_blindspot", summary["known_blind_spots"])
+            self.assertTrue(run["detected"], f"baseline={baseline}")
+
+    def test_image_blindspot_listed_in_limitation_doc(self):
+        """The (now closed) blind spot is documented in docs/limitations.md
+        so reviewers see the honest progression, not a cover-up."""
+        import pathlib
+        limitations = pathlib.Path("docs/limitations.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("image_blindspot", limitations)
 
 
 if __name__ == "__main__":
