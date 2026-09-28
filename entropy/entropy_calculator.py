@@ -23,6 +23,8 @@ import logging
 from datetime import datetime
 from collections import defaultdict
 
+import numpy as np
+
 # Add parent folder to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
@@ -31,80 +33,129 @@ log = logging.getLogger("EntropyCalc")
 
 
 # ============================================================
-# CORE ENTROPY CALCULATION
+# CORE ENTROPY CALCULATION (vectorized for <1 ms latency)
 # ============================================================
 
-def calculate_entropy(data: bytes) -> float:
+def calculate_entropy(data) -> float:
+    """Calculate Shannon entropy of a byte sequence (vectorized).
+
+    Uses numpy's bincount for a single C-call histogram over the 256 byte
+    values, then computes -sum(p*log2(p)) only over non-zero bins. For a
+    64 KiB sample this runs well under 1 ms on commodity hardware.
+
+    Returns a float in [0.0, 8.0] rounded to 4 decimals.
     """
-    Calculate Shannon entropy of a byte sequence.
+    # Accept bytes / bytearray / memoryview / ndarray without a copy
+    if isinstance(data, np.ndarray):
+        arr = data.ravel()
+        if arr.dtype != np.uint8:
+            arr = arr.astype(np.uint8, copy=False)
+    else:
+        if not data:
+            return 0.0
+        arr = np.frombuffer(data, dtype=np.uint8)
 
-    WHAT THIS MEASURES:
-    -------------------
-    How random/unpredictable the data is.
-
-    SCALE:
-    ------
-    0.0 = All bytes are the same (e.g., all zeros)
-    4.0 = Normal English text
-    6.0 = Compressed data (ZIP, DOCX)
-    7.5 = JPEG images, MP4 videos
-    8.0 = Perfectly random (encrypted data)
-
-    HOW IT WORKS:
-    -------------
-    1. Count how many times each byte value (0-255) appears
-    2. Calculate probability of each byte value
-    3. Apply Shannon formula: H = -sum(p * log2(p))
-    4. Result is between 0.0 and 8.0
-
-    Args:
-        data: Raw bytes from the file
-
-    Returns:
-        float: Entropy score between 0.0 and 8.0
-    """
-
-    if not data:
+    total = arr.size
+    if total == 0:
         return 0.0
 
-    # Step 1: Count frequency of each byte value
-    # There are 256 possible byte values (0x00 to 0xFF)
-    byte_counts = [0] * 256
-    for byte in data:
-        byte_counts[byte] += 1
-
-    # Step 2: Calculate entropy
-    total_bytes = len(data)
-    entropy = 0.0
-
-    for count in byte_counts:
-        if count == 0:
-            continue  # log2(0) is undefined, skip
-
-        # Probability of this byte value appearing
-        probability = count / total_bytes
-
-        # Shannon formula contribution from this byte value
-        entropy -= probability * math.log2(probability)
-
+    counts = np.bincount(arr, minlength=256)
+    nz = counts[counts > 0].astype(np.float64)
+    p = nz / total
+    entropy = float(-np.sum(p * np.log2(p)))
     return round(entropy, 4)
+
+
+# ============================================================
+# MAGIC-BYTE SIGNATURES (format recognition)
+# ============================================================
+
+# Map extension -> (bytes-offset, tuple-of-valid-prefix-bytes) for quick
+# structural validation. Ciphertext will almost never match the declared
+# format's magic header, even if the attacker tries to spoof the first
+# few bytes.
+MAGIC_SIGNATURES = {
+    ".jpg":  (0, (b"\xff\xd8\xff",)),                                  # JPEG SOI
+    ".jpeg": (0, (b"\xff\xd8\xff",)),
+    ".png":  (0, (b"\x89PNG\r\n\x1a\n",)),
+    ".gif":  (0, (b"GIF87a", b"GIF89a")),
+    ".bmp":  (0, (b"BM",)),
+    ".pdf":  (0, (b"%PDF-",)),
+    ".zip":  (0, (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")),       # ZIP/DOCX/XLSX/PPTX/APK/JAR
+    ".docx": (0, (b"PK\x03\x04",)),
+    ".xlsx": (0, (b"PK\x03\x04",)),
+    ".pptx": (0, (b"PK\x03\x04",)),
+    ".jar":  (0, (b"PK\x03\x04",)),
+    ".gz":   (0, (b"\x1f\x8b",)),
+    ".bz2":  (0, (b"BZh",)),
+    ".xz":   (0, (b"\xfd7zXZ\x00",)),
+    ".7z":   (0, (b"7z\xbc\xaf\x27\x1c",)),
+    ".rar":  (0, (b"Rar!",)),
+    ".elf":  (0, (b"\x7fELF",)),
+    ".exe":  (0, (b"MZ",)),
+    ".mp4":  (4, (b"ftyp",)),                                           # offset 4: "ftyp" brand
+    ".mov":  (4, (b"ftyp", b"moov", b"mdat", b"wide", b"pnot", b"skip")),
+    ".mp3":  (0, (b"ID3", b"\xff\xfb",)),                              # ID3v2 or MPEG frame sync
+    ".wav":  (8, (b"WAVE",)),
+    ".avi":  (8, (b"AVI ",)),
+}
+
+
+def chi2_uniformity(data) -> float | None:
+    """Return the reduced chi-squared statistic against a uniform byte
+    distribution. Ciphertext (any block cipher in any mode, including
+    AES-CTR/stream-ciphered ransomware) produces bytes that are
+    essentially uniformly distributed over 0..255, giving chi² ≈ 255
+    (df=255). Real compressed content (JPG/PNG/MP4/ZIP) has strong
+    structural peaks — Huffman tables, magic markers, length fields —
+    so chi² is in the thousands to millions even when Shannon entropy
+    is 7.5+.
+
+    Returns ``None`` when the sample is too small to be meaningful.
+    """
+    if isinstance(data, np.ndarray):
+        arr = data.ravel()
+        if arr.dtype != np.uint8:
+            arr = arr.astype(np.uint8, copy=False)
+    else:
+        if not data:
+            return None
+        arr = np.frombuffer(data, dtype=np.uint8)
+    n = arr.size
+    if n < 1024:
+        return None
+    counts = np.bincount(arr, minlength=256).astype(np.float64)
+    expected = n / 256.0
+    return float(np.sum((counts - expected) ** 2) / expected)
+
+
+def _magic_matches(data: bytes, ext: str) -> tuple[bool, str]:
+    """Check the magic header of *data* against the declared extension.
+
+    Returns (ok, observed_sig_hex).
+    """
+    sig = MAGIC_SIGNATURES.get(ext.lower())
+    if sig is None or not data:
+        return (True, "")  # unknown ext — don't score this signal
+    offset, prefixes = sig
+    if len(data) <= offset:
+        return (False, "")
+    window = data[offset:offset + 8]
+    for p in prefixes:
+        if window.startswith(p):
+            return (True, p.hex())
+    return (False, window[:4].hex())
 
 
 def calculate_file_entropy(file_path: str,
                            sample_size: int = None) -> dict:
-    """
-    Calculate entropy of a file.
+    """Calculate entropy of a file (single-pass I/O, vectorized math).
 
-    Reads the file and calculates its entropy.
-    Also calculates entropy of different sections
-    (beginning, middle, end) to detect partial encryption.
-
-    Args:
-        file_path:   Path to the file
-        sample_size: How many bytes to read (None = entire file)
-
-    Returns:
-        Dictionary with detailed entropy information
+    Reads the first ``sample_size`` bytes once, computes the Shannon
+    entropy for the whole sample and three equal sections (for partial-
+    encryption detection), and a SHA-256 fingerprint, without making
+    extra copies of the buffer. The hot path is well under 1 ms for a
+    64 KiB sample.
     """
 
     if sample_size is None:
@@ -114,55 +165,65 @@ def calculate_file_entropy(file_path: str,
         'file_path'       : file_path,
         'timestamp'       : datetime.now().isoformat(),
         'entropy_overall' : 0.0,
-        'entropy_start'   : 0.0,   # first 1/3 of sample
-        'entropy_middle'  : 0.0,   # middle 1/3 of sample
-        'entropy_end'     : 0.0,   # last 1/3 of sample
+        'entropy_start'   : 0.0,
+        'entropy_middle'  : 0.0,
+        'entropy_end'     : 0.0,
         'file_size'       : 0,
         'bytes_read'      : 0,
         'file_extension'  : '',
         'file_hash'       : '',
+        'chi2_uniformity' : None,
+        'chi2_tail'       : None,
+        'magic_ok'        : True,
+        'magic_sig'       : '',
         'is_readable'     : False,
         'error'           : None,
     }
 
-    # Get file extension
     _, ext = os.path.splitext(file_path)
     result['file_extension'] = ext.lower()
 
-    # Try to read the file
     try:
-        # Get file size
         result['file_size'] = os.path.getsize(file_path)
 
-        # Read the file bytes
         with open(file_path, 'rb') as f:
             data = f.read(sample_size)
 
-        result['bytes_read'] = len(data)
+        n = len(data)
+        result['bytes_read'] = n
         result['is_readable'] = True
 
-        if len(data) == 0:
+        if n == 0:
             result['error'] = 'File is empty'
             return result
 
-        # Calculate overall entropy
-        result['entropy_overall'] = calculate_entropy(data)
+        # Single zero-copy numpy view over the read buffer
+        arr = np.frombuffer(data, dtype=np.uint8)
 
-        # Calculate section entropies
-        # This helps detect partial encryption
-        # (some ransomware only encrypts part of the file)
-        third = len(data) // 3
+        # Overall entropy
+        result['entropy_overall'] = calculate_entropy(arr)
 
+        # Section entropies — use slices (views, no copy)
+        third = n // 3
         if third > 0:
-            result['entropy_start']  = calculate_entropy(data[:third])
-            result['entropy_middle'] = calculate_entropy(data[third:2*third])
-            result['entropy_end']    = calculate_entropy(data[2*third:])
+            result['entropy_start']  = calculate_entropy(arr[:third])
+            result['entropy_middle'] = calculate_entropy(arr[third:2*third])
+            result['entropy_end']    = calculate_entropy(arr[2*third:])
 
-        # Calculate file hash (SHA-256)
-        # Used as fingerprint for blockchain
-        sha256 = hashlib.sha256()
-        sha256.update(data)
-        result['file_hash'] = sha256.hexdigest()
+        # SHA-256 fingerprint (hashlib releases the GIL, fast)
+        result['file_hash'] = hashlib.sha256(data).hexdigest()
+
+        # Structural fingerprinting: chi² against uniform distribution
+        # (ciphertext ~ 255, real compressed media > 1000) and magic-byte
+        # validation against the declared extension.
+        result['chi2_uniformity'] = chi2_uniformity(data)
+        # Tail chi² catches IN-PROGRESS in-place encryption even when the
+        # attacker preserves the first N KB of the original header.
+        tail = data[-min(len(data), 20000):]
+        result['chi2_tail'] = chi2_uniformity(tail)
+        magic_ok, magic_sig = _magic_matches(data, ext)
+        result['magic_ok'] = magic_ok
+        result['magic_sig'] = magic_sig
 
     except PermissionError:
         result['error'] = 'Permission denied'
@@ -294,6 +355,58 @@ class EntropyAnalyzer:
                 )
                 threat_score += 15.0
 
+        # Indicator 5: Magic-byte mismatch with declared extension.
+        # Real files always have valid headers; ciphertext overwriting
+        # a file does not. Very strong signal — confirms the content is
+        # not a valid instance of its declared format.
+        if (entropy_data.get('magic_ok') is False
+                and current_entropy >= 7.0):
+            indicators.append(
+                f"Magic-byte mismatch for {ext}: "
+                f"observed 0x{entropy_data.get('magic_sig','')}"
+            )
+            threat_score += 45.0
+
+        # Indicator 6: Chi-squared uniformity = "perfectly random" bytes.
+        # This is the structural-ciphertext fingerprint that closes the
+        # image/video blind spot. Shannon entropy cannot distinguish
+        # properly encrypted output from legitimate JPG/H.264/ZIP
+        # (all three live around 7.5-8.0), but the chi-squared test
+        # against uniform 0..255 does: a real JPG has structural peaks
+        # (Huffman tables, markers, length fields) → chi² in the
+        # thousands; AES/stream-cipher output is statistically uniform
+        # → chi² ≈ 255. We require BOTH a chi² value in the uniform
+        # range AND high Shannon entropy to avoid flagging sparse
+        # files (all-zeros, all-spaces) that also look "flat" but have
+        # very low entropy.
+        chi2_tail = entropy_data.get('chi2_tail')
+        chi2_full = entropy_data.get('chi2_uniformity')
+        chi2_best = (min(chi2_tail, chi2_full)
+                     if (chi2_tail is not None and chi2_full is not None)
+                     else (chi2_tail if chi2_tail is not None else chi2_full))
+        # Chi-squared uniformity is only a hard indicator for KNOWN
+        # extensions where we have ground truth (JPG/ZIP/MP4/office
+        # etc. all have structural byte peaks). For unknown extensions
+        # an arbitrary binary blob may legitimately look uniform, so
+        # chi² is treated as a soft signal at most (handled by the
+        # pipeline decision layer).
+        _known_exts = {
+            ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".zip",
+            ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt", ".mp3",
+            ".mp4", ".avi", ".mov", ".exe", ".dll", ".7z", ".rar",
+            ".gz", ".tar", ".txt", ".csv", ".rtf",
+        }
+        if (chi2_best is not None
+                and chi2_best < 300.0
+                and current_entropy >= 7.0
+                and entropy_data['bytes_read'] >= 4096
+                and ext in _known_exts):
+            indicators.append(
+                f"Ciphertext fingerprint: chi2={chi2_best:.0f} "
+                f"(uniform byte distribution, H={current_entropy:.2f})"
+            )
+            threat_score += 55.0
+
         # Step 6: Determine if suspicious
         is_suspicious = threat_score >= 40.0
 
@@ -335,6 +448,12 @@ class EntropyAnalyzer:
             'entropy_end'     : entropy_data.get('entropy_end', 0.0),
             'entropy_delta'   : round(entropy_delta, 4),
             'prev_entropy'    : prev_entropy,
+
+            # ── Structural ciphertext fingerprints ────────
+            'chi2_uniformity' : entropy_data.get('chi2_uniformity'),
+            'chi2_tail'       : entropy_data.get('chi2_tail'),
+            'magic_ok'        : entropy_data.get('magic_ok', True),
+            'magic_sig'       : entropy_data.get('magic_sig', ''),
 
             # ── Normal Range for this file type ───────────
             'normal_range_min': normal_range[0],

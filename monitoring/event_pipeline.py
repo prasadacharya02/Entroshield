@@ -456,6 +456,12 @@ class EventPipeline:
             'prev_entropy'     : entropy_result['prev_entropy'],
             'file_hash'        : entropy_result['file_hash'],
 
+            # ── Structural ciphertext fingerprints ─────────
+            'chi2_uniformity'  : entropy_result.get('chi2_uniformity'),
+            'chi2_tail'        : entropy_result.get('chi2_tail'),
+            'magic_ok'         : entropy_result.get('magic_ok', True),
+            'magic_sig'        : entropy_result.get('magic_sig', ''),
+
             # ── Normal Range ───────────────────────────────
             'normal_range_min' : entropy_result['normal_range_min'],
             'normal_range_max' : entropy_result['normal_range_max'],

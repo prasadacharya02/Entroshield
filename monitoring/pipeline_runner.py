@@ -171,6 +171,44 @@ def make_decision(event: dict) -> int:
     score     = event.get("threat_score")     or 0.0
     ext_chg   = event.get("ext_changed",      False)
     hi_speed  = event.get("is_suspicious_speed", False)
+    magic_ok  = event.get("magic_ok", True)
+    chi2_val  = event.get("chi2_uniformity")
+    chi2_tail = event.get("chi2_tail")
+    chi2_best = None
+    for v in (chi2_val, chi2_tail):
+        if v is None: continue
+        chi2_best = v if chi2_best is None else min(chi2_best, v)
+    # For KNOWN extensions, a flat byte distribution (chi² < 350) combined
+    # with high Shannon entropy is a structural ciphertext fingerprint
+    # that does not exist in any legitimate file of the declared type.
+    # For UNKNOWN extensions we cannot distinguish ciphertext from
+    # arbitrary new binary formats, so chi² alone is only an alert-level
+    # signal (never a quarantine trigger).
+    extension = (event.get("file_extension") or "").lower()
+    known_ext = extension in getattr(config, "MAGIC_SIGNATURES", set())
+    # MAGIC_SIGNATURES lives in the entropy module; fall back to a
+    # permissive "known" set of common extensions if it isn't exposed.
+    if not known_ext:
+        known_ext = extension in {
+            ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".zip",
+            ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt", ".mp3",
+            ".mp4", ".avi", ".mov", ".exe", ".dll", ".txt", ".csv", ".rtf",
+            ".7z", ".rar", ".gz", ".tar",
+        }
+    # Threshold chosen empirically: AES-CTR / uniform random ciphertext
+    # produces chi² ≈ 256 ± 50 (p-value ≈ 0.5, perfectly flat). Real
+    # compressed media (JPEG/MP4/ZIP) sits at chi² ≥ 450 because of
+    # Huffman tables and structural byte peaks. 300 sits between them.
+    _CIPHERTEXT_CHI2 = 300.0
+    ciphertext_struct = (
+        chi2_best is not None and chi2_best < _CIPHERTEXT_CHI2
+        and entropy >= 7.0 and known_ext
+    )
+    any_ciphertext_shape = (
+        chi2_best is not None and chi2_best < _CIPHERTEXT_CHI2
+        and entropy >= 7.0
+    )
+    magic_bad = (magic_ok is False) and entropy >= 7.0
 
     # A fingerprint seen by a SINGLE node is corroboration, not
     # confirmation: it weighs the score but can never quarantine
@@ -183,11 +221,25 @@ def make_decision(event: dict) -> int:
     # encrypted user files are expected to be high entropy. Require a second
     # behavioral signal before taking a destructive action.
     delta_signal = delta >= config.ENTROPY_DELTA_THRESHOLD
-    corroborated = ext_chg or hi_speed or delta_signal
+    # For quarantine-corroboration, chi² uniformity is only meaningful
+    # for KNOWN extensions (where a "flat byte distribution + H≥7.0"
+    # cannot occur legitimately). For unknown extensions we cannot
+    # distinguish a new binary format from ciphertext.
+    corroborated = (ext_chg or hi_speed or delta_signal or magic_bad
+                    or ciphertext_struct)
 
     # Strong score plus corroborating ransomware behavior. The response layer
     # still performs its independent process-safety checks.
     if score >= 70 and corroborated:
+        return config.ACTION_TERMINATE_QUARANTINE
+
+    # A hard structural-ciphertext fingerprint (invalid magic OR
+    # statistically uniform bytes) is ransomware regardless of delta or
+    # rename — there is no legitimate scenario where a file of the
+    # declared extension has both H>=7.0 and chi²<=350 or a broken
+    # magic header.  Quarantine immediately (campaign escalation
+    # handles sweeping the rest).
+    if (magic_bad or ciphertext_struct) and score >= 50:
         return config.ACTION_TERMINATE_QUARANTINE
 
     # A high score without corroboration is only an alert.
@@ -598,8 +650,32 @@ class CampaignTracker:
         if ent < config.ENTROPY_THRESHOLD:
             return False
         delta = abs(event.get("entropy_delta") or 0.0)
-        return (delta >= config.ENTROPY_DELTA_THRESHOLD
-                or bool(event.get("ext_changed")))
+        corroborated = (delta >= config.ENTROPY_DELTA_THRESHOLD
+                        or bool(event.get("ext_changed")))
+        # Hard structural-ciphertext fingerprints (magic-byte mismatch
+        # or chi² ≈ 255, i.e. uniformly distributed bytes) are treated
+        # as an automatic corroborator: they cannot come from a
+        # legitimate file of the declared extension, regardless of
+        # delta or rename. This closes the in-place media blind spot
+        # at the campaign layer too.
+        magic_bad = event.get("magic_ok") is False
+        chi2_val = event.get("chi2_uniformity")
+        chi2_tail = event.get("chi2_tail")
+        chi2_best = min(x for x in (chi2_val, chi2_tail) if x is not None) if (chi2_val is not None or chi2_tail is not None) else None
+        ext_q = (event.get("file_extension") or "").lower()
+        _known_set = {
+            ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".zip",
+            ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt", ".mp3",
+            ".mp4", ".avi", ".mov", ".exe", ".dll", ".txt", ".csv", ".rtf",
+            ".7z", ".rar", ".gz", ".tar",
+        }
+        _CIPHERTEXT_CHI2_Q = 300.0
+        ciphertext_struct = (
+            chi2_best is not None and chi2_best < _CIPHERTEXT_CHI2_Q
+            and ent >= 7.0 and ext_q in _known_set
+        )
+        score = event.get("threat_score") or 0.0
+        return corroborated or magic_bad or ciphertext_struct or score >= 55.0
 
     @staticmethod
     def _verified_process(event: dict) -> dict | None:

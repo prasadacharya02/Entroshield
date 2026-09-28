@@ -13,6 +13,12 @@ htmlcov/
 .venv/
 venv/
 env/
+py-env/
+.runenv/
+
+# Repo-local pip install targets (bootstrap cache, not source)
+_deps/
+_pylibs/
 
 # Local configuration and credentials
 .env

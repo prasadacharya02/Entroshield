@@ -404,11 +404,7 @@ def send_html(handler):
     )
     html = html.replace(
         "__CONTROL_TOKEN__",
-<<<<<<< HEAD
-        getattr(config, "CONTROL_TOKEN", "")
-=======
-        config.CONTROL_TOKEN or "",
->>>>>>> 85a04faf32325b1e508a3812f9a640202c9cea72
+        getattr(config, "CONTROL_TOKEN", "") or "",
     )
 
     body = html.encode("utf-8")

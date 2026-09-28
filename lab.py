@@ -16,7 +16,39 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-PYTHON = sys.executable
+
+# ── Auto-bootstrap ────────────────────────────────────────────
+# If the user site-packages got wiped (sandbox snapshots do this),
+# silently reinstall requirements before spawning children.
+def _ensure_deps() -> None:
+    try:
+        import flask, psutil, numpy, watchdog, sklearn, eventlet, flask_socketio  # noqa: F401
+        return
+    except ImportError:
+        pass
+    req = ROOT / "requirements-ci.txt"
+    if req.exists():
+        import subprocess as _sp
+        print("[lab] Installing dependencies (one-time)...", flush=True)
+        _sp.check_call(
+            [sys.executable, "-m", "pip", "install", "--user",
+             "--no-cache-dir", "-q", "-r", str(req)],
+            env={**os.environ, "PIP_BREAK_SYSTEM_PACKAGES": "1"},
+        )
+_ensure_deps()
+
+# Make user site-packages visible to this process (and children via env).
+import site as _site
+_site.main()
+_sp_user = _site.getusersitepackages()
+if _sp_user not in sys.path:
+    sys.path.insert(0, _sp_user)
+os.environ["PYTHONPATH"] = _sp_user + os.pathsep + os.environ.get("PYTHONPATH", "")
+
+# Prefer a repo-local virtualenv when one exists; otherwise fall back to
+# the system python (deps installed via pip3 --user).
+_VENV_CANDIDATES = [ROOT / n / "bin" / "python" for n in (".runenv", "py-env", ".venv")]
+PYTHON = next((str(p) for p in _VENV_CANDIDATES if p.exists()), sys.executable)
 
 SERVICES = (
     ("pipeline", [PYTHON, str(ROOT / "monitoring" / "pipeline_runner.py")]),
