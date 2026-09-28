@@ -603,6 +603,26 @@ def _kill_record(killed: bool, pid, procname: str,
     return None
 
 
+def _needs_ciphertext_repair(analysis: dict) -> bool:
+    """True when a changed file really looks like leftover ciphertext.
+
+    Post-kill verification exists to repair files the malware wrote over.
+    A file that merely changed (a legitimate edit, or the demo estate
+    being regenerated) has to be left alone - the detector's own signals
+    decide: a destroyed format header or a suspicious/conclusive threat
+    score.
+    """
+    if not isinstance(analysis, dict):
+        return False
+    if analysis.get("magic_ok") is False:
+        return True
+    try:
+        score = float(analysis.get("threat_score") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    return score >= 40.0
+
+
 def _is_defender_store(path: str) -> bool:
     """True for paths inside the quarantine vault or the backup store."""
     if not path:
@@ -1464,6 +1484,15 @@ class PipelineRunner:
                     except Exception:
                         result = {}
                     entropy = float(result.get("entropy_overall") or 0.0)
+                    if not _needs_ciphertext_repair(result):
+                        # A clean file that simply changed (a user edit, an
+                        # estate reset) must not be reverted: overwriting it
+                        # with an older copy is data loss, not defence.
+                        log.info(
+                            f"  [SWEEP] {name}: content differs from last "
+                            f"clean version (H={entropy:.2f}) but shows no "
+                            f"ciphertext evidence — left as is")
+                        continue
                     log.warning(
                         f"  [SWEEP] {name}: content differs from last clean "
                         f"version (H={entropy:.2f}) — quarantining + "

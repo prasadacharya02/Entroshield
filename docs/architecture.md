@@ -34,7 +34,8 @@ monitoring.event_pipeline.EventPipeline (queue 10000, batch 50)
         at attribution, in campaign kill memory and at the termination gate
       - FileQuarantine: install-time folder, SHA3-256 + SHA-256 dual hash, meta.json
     → Campaign sweep (quarantine+restore all campaign files)
-    → Post-kill verification (walk estate, hash vs last clean, repair mid-write)
+    → Post-kill verification (walk estate; repair only files that still show
+      ciphertext evidence - a clean file that merely changed is left alone)
     → response.backup_manager.BackupManager.restore (clean v1, rename-back)
     → response.forensic_report (one JSON per incident)
     → blockchain.connector.BlockchainConnector
@@ -116,4 +117,4 @@ These emit DeprecationWarning and delegate to canonical implementations.
 
 ### For 200 Marks
 
-This architecture is not PowerPoint - it's running code with 218 tests, deterministic benchmark, live demo verified, honest limitations published.
+This architecture is not PowerPoint - it's running code with 222 tests, deterministic benchmark, live demo verified, honest limitations published.

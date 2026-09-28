@@ -31,6 +31,73 @@ from monitoring.watchdog_monitor import ProcessFinder
 from storage.database import connect, init_db
 
 
+class FixtureStructureTests(unittest.TestCase):
+    """The victim estate must not look like corrupted ciphertext.
+
+    The fixtures used to hide PNG bytes inside ``.jpg``/``.zip`` files (and
+    plain text inside a ``.docx``), so every benign rewrite tripped the
+    magic-byte detector: the defender quarantined ~20 its own clean files,
+    which inflated the SOC counters with threats that never existed.
+    """
+
+    def test_every_fixture_matches_its_extension_magic(self):
+        from entropy.entropy_calculator import _magic_matches
+        from victim_server.create_fake_files import create_all_files
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "victim"
+        create_all_files(root, clean=True, quiet=True)
+
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            with self.subTest(file=str(path.relative_to(root))):
+                ok, signature = _magic_matches(path.read_bytes(), path.suffix)
+                self.assertTrue(
+                    ok, f"{path.name} header {signature!r} does not match "
+                        f"{path.suffix}")
+
+    def test_fixtures_are_never_flagged_by_the_detector(self):
+        from entropy.entropy_calculator import EntropyAnalyzer
+        from victim_server.create_fake_files import create_all_files
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "victim"
+        create_all_files(root, clean=True, quiet=True)
+        analyzer = EntropyAnalyzer()
+
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            with self.subTest(file=str(path.relative_to(root))):
+                result = analyzer.analyze(str(path))
+                self.assertEqual(result.get("threat_score") or 0, 0.0,
+                                 result.get("reasons"))
+
+
+class PostKillRepairGateTests(unittest.TestCase):
+    """Post-kill verification repairs ciphertext, not legitimate edits."""
+
+    def test_ciphertext_evidence_triggers_repair(self):
+        from monitoring.pipeline_runner import _needs_ciphertext_repair
+
+        self.assertTrue(_needs_ciphertext_repair(
+            {"magic_ok": False, "threat_score": 0.0}))
+        self.assertTrue(_needs_ciphertext_repair(
+            {"magic_ok": True, "threat_score": 45.0}))
+
+    def test_clean_edit_is_left_alone(self):
+        from monitoring.pipeline_runner import _needs_ciphertext_repair
+
+        self.assertFalse(_needs_ciphertext_repair(
+            {"magic_ok": True, "threat_score": 0.0,
+             "entropy_overall": 7.58}))
+        self.assertFalse(_needs_ciphertext_repair({}))
+        self.assertFalse(_needs_ciphertext_repair(None))
+
+
 class NeverKillListTests(unittest.TestCase):
     """config.is_denied_process must recognise user/OS software."""
 
